@@ -572,18 +572,88 @@ async function actingIaddrs() {
 }
 
 let _marketLoadToken = 0;
+// Per-endpoint cache. Rapid tab clicks used to fire 3 fresh fetches per tab
+// switch and trip scan.verus.cx 429 rate limits, leaving the row list empty.
+// Each endpoint caches independently for 15s; if a fetch fails (429/network)
+// we fall back to last-known-good data rather than wiping the list.
+const _marketEndpointCache = new Map(); // path -> { at, data, inflight }
+const MARKET_CACHE_TTL_MS = 15000;
+async function fetchOneMarketTab(path) {
+  const now = Date.now();
+  let slot = _marketEndpointCache.get(path);
+  if (slot && slot.data && (now - slot.at) < MARKET_CACHE_TTL_MS) {
+    return slot.data;
+  }
+  if (slot && slot.inflight) return slot.inflight;
+  if (!slot) { slot = { at: 0, data: null, inflight: null }; _marketEndpointCache.set(path, slot); }
+  slot.inflight = (async () => {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const r = await fetch(`${EXPLORER_API}${path}`);
+        if (r.status === 429) {
+          if (attempt === 0) {
+            await new Promise((res) => setTimeout(res, 700 + Math.random() * 400));
+            continue;
+          }
+          // Fall back to stale data if we have it; otherwise an empty result
+          // marked __failed so the caller can keep existing rows.
+          return slot.data || { __failed: true, results: [] };
+        }
+        const json = await r.json();
+        slot.data = json;
+        slot.at = Date.now();
+        return json;
+      } catch {
+        if (attempt === 0) {
+          await new Promise((res) => setTimeout(res, 500));
+          continue;
+        }
+        return slot.data || { __failed: true, results: [] };
+      }
+    }
+    return slot.data || { __failed: true, results: [] };
+  })();
+  try {
+    return await slot.inflight;
+  } finally {
+    slot.inflight = null;
+  }
+}
+async function fetchMarketBundle() {
+  return Promise.all([
+    fetchOneMarketTab("/contracts/loans/requests?pageSize=200"),
+    fetchOneMarketTab("/contracts/loans/offers?pageSize=200"),
+    fetchOneMarketTab("/contracts/loans/matches?pageSize=200"),
+  ]);
+}
+function invalidateMarketCache() {
+  for (const slot of _marketEndpointCache.values()) {
+    slot.at = 0;
+    slot.data = null;
+    slot.inflight = null;
+  }
+}
 async function loadMarket() {
   const myToken = ++_marketLoadToken;
   const el = document.getElementById("market-list");
-  el.textContent = "Loading…";
+  // Only show "Loading…" if the row list is currently empty. Otherwise
+  // keep showing the previous rows until the new fetch resolves — prevents
+  // the "shows then goes away" flicker on rapid tab switches.
+  if (!el.querySelector(".mp-row")) el.textContent = "Loading…";
   const acting = actingIaddr();
 
-  // Pull all three explorer endpoints in parallel for counts
-  const [reqRes, offRes, mchRes] = await Promise.all([
-    fetch(`${EXPLORER_API}/contracts/loans/requests?pageSize=200`).then((r) => r.json()).catch(() => ({ results: [] })),
-    fetch(`${EXPLORER_API}/contracts/loans/offers?pageSize=200`).then((r) => r.json()).catch(() => ({ results: [] })),
-    fetch(`${EXPLORER_API}/contracts/loans/matches?pageSize=200`).then((r) => r.json()).catch(() => ({ results: [] })),
-  ]);
+  const bundle = await fetchMarketBundle();
+  if (myToken !== _marketLoadToken) return;
+  const [reqRes, offRes, mchRes] = bundle;
+  // If the active tab's data fetch failed (rate-limited) and we already have
+  // rows rendered, keep them — don't replace with "No matches for this scope".
+  const activeFailed =
+    (mpTab === "requests" && reqRes.__failed) ||
+    (mpTab === "offers" && offRes.__failed) ||
+    (mpTab === "matches" && mchRes.__failed);
+  if (activeFailed && el.querySelector(".mp-row")) {
+    return;
+  }
 
   // Counts respect the picker scope. HTML id naming is unfortunate:
   //   ct-requests → "Open requests"     (loan.request)
@@ -669,42 +739,121 @@ async function loadMarket() {
   if (myToken !== _marketLoadToken) return; // newer load wins
   el.innerHTML = rows.map(render).join("");
 
-  // For matches: enrich each row with the linked request's terms + lender's R-balance
-  if (mpTab === "matches") enrichMatchRows();
+  // For matches: enrich each row with the linked request's terms + lender's R-balance.
+  // Pass myToken so each enrichment can bail if a newer load fires mid-fetch.
+  if (mpTab === "matches") enrichMatchRows(myToken);
 }
 
-async function enrichMatchRows() {
+async function enrichMatchRows(token) {
   const rowEls = document.querySelectorAll(".mp-row[data-match-key]");
   for (const rowEl of rowEls) {
     const r = matchByKey.get(rowEl.dataset.matchKey);
     if (!r) continue;
-    // Fetch linked request (terms come from the request, not the match)
-    enrichMatchRowTerms(rowEl, r);
-    // Fetch lender's R-address balance
-    enrichMatchRowBalance(rowEl, r);
+    enrichMatchRowTerms(rowEl, r, token);
+    enrichMatchRowBalance(rowEl, r, token);
   }
 }
 
-async function enrichMatchRowTerms(rowEl, r) {
+// Per-URL cache + retry, persisted to localStorage. Match terms don't change
+// once posted, so a 24h TTL means most page loads serve straight from cache
+// and don't even touch the explorer — fixing the "(linked request not found)"
+// flicker on reloads when scan.verus.cx 429s us.
+const ENRICH_LS_KEY = "vl_enrich_cache_v1";
+const ENRICH_TTL_MS = 24 * 3600 * 1000;
+const _enrichCache = (() => {
+  try {
+    const raw = localStorage.getItem(ENRICH_LS_KEY);
+    if (!raw) return new Map();
+    const obj = JSON.parse(raw);
+    const now = Date.now();
+    return new Map(Object.entries(obj).filter(([_, v]) => v && (now - v.at) < ENRICH_TTL_MS));
+  } catch { return new Map(); }
+})();
+let _enrichCacheDirty = false;
+function _persistEnrichCache() {
+  if (!_enrichCacheDirty) return;
+  _enrichCacheDirty = false;
+  try {
+    const obj = {};
+    for (const [k, v] of _enrichCache) obj[k] = v;
+    localStorage.setItem(ENRICH_LS_KEY, JSON.stringify(obj));
+  } catch {}
+}
+setInterval(_persistEnrichCache, 2000);
+function _enrichGet(url) {
+  const slot = _enrichCache.get(url);
+  if (!slot) return null;
+  if ((Date.now() - slot.at) > ENRICH_TTL_MS) { _enrichCache.delete(url); return null; }
+  return slot.data;
+}
+function _enrichSet(url, data) {
+  _enrichCache.set(url, { at: Date.now(), data });
+  _enrichCacheDirty = true;
+}
+async function fetchJsonWithRetry(url, { useCacheFirst = false } = {}) {
+  // If cache-first: return cached immediately if present, fetch in background only on misses.
+  if (useCacheFirst) {
+    const cached = _enrichGet(url);
+    if (cached) return cached;
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await fetch(url);
+      if (r.status === 429) {
+        if (attempt < 2) {
+          await new Promise((res) => setTimeout(res, 800 + attempt * 600 + Math.random() * 400));
+          continue;
+        }
+        return _enrichGet(url);
+      }
+      const json = await r.json();
+      _enrichSet(url, json);
+      return json;
+    } catch {
+      if (attempt < 2) {
+        await new Promise((res) => setTimeout(res, 500));
+        continue;
+      }
+      return _enrichGet(url);
+    }
+  }
+  return _enrichGet(url);
+}
+async function enrichMatchRowTerms(rowEl, r, token) {
   const cell = rowEl.querySelector(".terms-summary");
   if (!cell || !r.request?.iaddr) return;
   let req = null;
+  let lastError = null;
   try {
-    // Look up the linked request — try current state first, then history
-    const cur = await fetch(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`).then((rr) => rr.json());
-    req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+    // Look up the linked request — try current state first, then history.
+    // Use cache-first: matches don't change once posted, so localStorage hits
+    // skip the network entirely on subsequent loads.
+    const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
+    if (cur) {
+      req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+    }
     if (!req) {
       // Fallback: pull from history (the request may have been removed from current state)
-      const hist = await fetch(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`).then((rr) => rr.json());
-      const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid)
-              || (hist.results || [])[0];
-      const p = ev?.entries?.[0]?.decoded;
-      if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
+      const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
+      if (hist) {
+        const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid)
+                || (hist.results || [])[0];
+        const p = ev?.entries?.[0]?.decoded;
+        if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
+      } else if (!cur) {
+        lastError = "rate-limited";
+      }
     }
-  } catch {}
+  } catch (e) {
+    lastError = e.message;
+  }
+
+  // Bail if a newer load has started OR the row was detached
+  if (token !== undefined && token !== _marketLoadToken) return;
+  if (!rowEl.isConnected) return;
 
   if (!req || !req.principal) {
-    cell.textContent = "(linked request not found)";
+    cell.textContent = lastError ? `(fetch error: ${lastError})` : "(linked request not found)";
     return;
   }
   const rate = req.principal && req.repay && req.principal.amount > 0
@@ -720,25 +869,43 @@ async function enrichMatchRowTerms(rowEl, r) {
   rowEl.dataset.collateralCurrency = req.collateral?.currency || "";
   rowEl.dataset.collateralAmount = String(req.collateral?.amount ?? "");
   // Once terms are ready, refresh borrower balance check
-  enrichBorrowerCollateralBalance(rowEl, r);
+  enrichBorrowerCollateralBalance(rowEl, r, token);
 }
 
-async function enrichMatchRowBalance(rowEl, r) {
-  // Lender balance — small auxiliary signal; we now show borrower balance more prominently
-  // via enrichBorrowerCollateralBalance once terms are loaded.
+async function enrichMatchRowBalance(rowEl, r, token) {
   const cell = rowEl.querySelector(".balance-cell");
-  if (!cell || !r.lender_address) return;
-  try {
-    const bal = await rpc("getaddressbalance", [{ addresses: [r.lender_address] }]);
-    cell.innerHTML = `<code>${escapeHtml(r.lender_address)}</code> · ${fmtBalances(bal?.currencybalance || { VRSC: (bal?.balance ?? 0) / 1e8 })}`;
-    cell.classList.remove("muted");
-  } catch {
-    cell.textContent = "(unavailable)";
+  if (!cell) return;
+  // If the borrower is the acting identity, show THEIR R balance instead of
+  // the lender's — the lender's balance isn't useful from the borrower's POV.
+  const acting = actingIaddr();
+  const actingIsBorrower = acting && acting !== "all" && r.request?.iaddr === acting;
+  let address = r.lender_address;
+  if (actingIsBorrower) {
+    try {
+      const info = await rpc("getidentity", [acting]);
+      address = (info?.identity?.primaryaddresses || [])[0] || null;
+    } catch {}
   }
+  if (!address) return;
+  let result, error;
+  try {
+    const bal = await rpc("getaddressbalance", [{ addresses: [address] }]);
+    result = `<code>${escapeHtml(address)}</code> · ${fmtBalances(bal?.currencybalance || { VRSC: (bal?.balance ?? 0) / 1e8 })}`;
+  } catch (e) {
+    error = e.message;
+  }
+  if (token !== undefined && token !== _marketLoadToken) return;
+  if (!rowEl.isConnected) return;
+  if (error) {
+    cell.textContent = `(balance error: ${error})`;
+    return;
+  }
+  cell.innerHTML = result;
+  cell.classList.remove("muted");
 }
 
 // After terms load, append borrower's collateral check to the terms panel
-async function enrichBorrowerCollateralBalance(rowEl, r) {
+async function enrichBorrowerCollateralBalance(rowEl, r, token) {
   const acting = actingIaddr();
   if (!acting || acting === "all") return;
   const collCcy = rowEl.dataset.collateralCurrency;
@@ -762,16 +929,35 @@ async function enrichBorrowerCollateralBalance(rowEl, r) {
       const name = KNOWN_NAME_BY_ID[k] || k;
       if (name === collCcy || k === collCcy) { have = parseFloat(v); break; }
     }
+    if (token !== undefined && token !== _marketLoadToken) return;
+    if (!rowEl.isConnected) return;
     const sufficient = have >= collAmt;
+    const termsEl = rowEl.querySelector(".match-terms");
+    if (!termsEl) return;
+    // Idempotent: remove any prior note before appending
+    termsEl.querySelectorAll(".borrower-collateral-note").forEach((n) => n.remove());
     const note = document.createElement("div");
-    note.className = "muted";
+    note.className = "muted borrower-collateral-note";
     note.style.fontSize = "12px";
     note.style.marginTop = "4px";
     note.innerHTML = sufficient
       ? `<span style="color:var(--good)">✓ Your wallet has ${have} ${collCcy}</span> at <code>${escapeHtml(primaryR)}</code>`
       : `<span style="color:var(--bad)">✗ Your wallet only has ${have} ${collCcy}</span> at <code>${escapeHtml(primaryR)}</code> (need ${collAmt})`;
-    rowEl.querySelector(".match-terms").appendChild(note);
-  } catch {}
+    termsEl.appendChild(note);
+  } catch (e) {
+    // Surface but quietly — borrower balance is auxiliary
+    if (rowEl.isConnected) {
+      const termsEl = rowEl.querySelector(".match-terms");
+      if (termsEl && !termsEl.querySelector(".borrower-collateral-note")) {
+        const note = document.createElement("div");
+        note.className = "muted borrower-collateral-note";
+        note.style.fontSize = "11px";
+        note.style.marginTop = "4px";
+        note.textContent = `(balance check failed: ${e.message})`;
+        termsEl.appendChild(note);
+      }
+    }
+  }
 }
 
 function renderMarketRequest(r, mySet, myMap, acting) {
@@ -882,12 +1068,12 @@ function renderMarketMatch(r, mySet, myMap, acting) {
       </div>
       <div class="match-terms" style="margin-top:8px;padding:10px;border:1px solid var(--border);border-radius:6px;background:rgba(0,0,0,0.15)">
         <div class="muted" style="font-size:11px;margin-bottom:6px">If you accept:</div>
-        <div class="terms-summary muted" style="font-size:13px">loading terms…</div>
+        <div class="terms-summary muted" style="font-size:13px">fetching terms…</div>
       </div>
       <div class="kv" style="margin-top:8px;font-size:12px">
         <div><span class="k">vault</span><span class="v"><code>${escapeHtml(r.vault_address || "—")}</code></span></div>
         <div><span class="k">expires</span><span class="v">block ${r.expires_block ?? "—"}</span></div>
-        <div class="lender-row"><span class="k">lender R balance</span><span class="v"><span class="muted balance-cell">checking…</span></span></div>
+        <div class="lender-row"><span class="k">${toActing ? "your R balance" : "lender R balance"}</span><span class="v"><span class="muted balance-cell">checking…</span></span></div>
       </div>
       <div style="margin-top:8px">
         <button class="ghost" data-mp-row-act="toggle-raw" style="font-size:11px;padding:3px 8px">▸ Show raw payload</button>
@@ -993,13 +1179,15 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     // Pull the linked request to know the exact amounts
     let req = null;
     try {
-      const cur = await fetch(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`).then((rr) => rr.json());
-      req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
+      const cur = await fetchJsonWithRetry(`${EXPLORER_API}/contracts/loans/requests?iaddr=${encodeURIComponent(r.request.iaddr)}&include_inactive=true&pageSize=10`, { useCacheFirst: true });
+      if (cur) req = (cur.results || []).find((x) => !r.request.txid || x.posted_tx === r.request.txid) || (cur.results || [])[0];
       if (!req) {
-        const hist = await fetch(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`).then((rr) => rr.json());
-        const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist.results || [])[0];
-        const p = ev?.entries?.[0]?.decoded;
-        if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
+        const hist = await fetchJsonWithRetry(`${EXPLORER_API}/identity/events?type=loan.request&iAddress=${encodeURIComponent(r.request.iaddr)}&history=true&pageSize=20`, { useCacheFirst: true });
+        if (hist) {
+          const ev = (hist.results || []).find((x) => !r.request.txid || x.chain?.txid === r.request.txid) || (hist.results || [])[0];
+          const p = ev?.entries?.[0]?.decoded;
+          if (p) req = { principal: p.principal, collateral: p.collateral, repay: p.repay, term_days: p.term_days };
+        }
       }
     } catch {}
     panel.innerHTML = `
@@ -1054,6 +1242,7 @@ document.getElementById("market-refresh").onclick = async () => {
   // or balance change is picked up. Then repopulate picker + reload tabs.
   cachedSpendableIds = [];
   pickerByR = new Map();
+  invalidateMarketCache();
   await populateActingPicker();
   loadMarket();
   loadLoans();
@@ -1339,6 +1528,7 @@ async function loadLoans() {
   );
   const flat = all.flat();
   if (flat.length === 0) {
+    const acting = actingIaddr();
     el.innerHTML = `<div class="empty">No active loans${acting !== "all" ? " for this identity" : " on any local identity"}.</div>`;
     return;
   }
