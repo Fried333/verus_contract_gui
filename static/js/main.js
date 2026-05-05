@@ -293,9 +293,15 @@ async function buildAndSignBorrowerTxA({
   const collateralCcyId = await ccyIaddr(collateralCurrency);
   if (!principalCcyId || !collateralCcyId) throw new Error("could not resolve currency ids");
 
-  // Borrower's change in the collateral currency (from the same UTXO)
-  const change = utxoAmount - collateralAmount - FEE;
-  if (change < 0) throw new Error(`UTXO too small: have ${utxoAmount} ${collateralCurrency}, need ${collateralAmount + FEE}`);
+  // Borrower's change in the collateral currency (from the same UTXO).
+  // Compare in integer satoshis to avoid float-precision bugs
+  // (0.5001 - 0.5 - 0.0001 ≈ -1e-17 in JS floats).
+  const utxoSats = Math.round(utxoAmount * 1e8);
+  const collateralSats = Math.round(collateralAmount * 1e8);
+  const feeSats = Math.round(FEE * 1e8);
+  const changeSats = utxoSats - collateralSats - feeSats;
+  if (changeSats < 0) throw new Error(`UTXO too small: have ${utxoSats} sats ${collateralCurrency}, need ${collateralSats + feeSats}`);
+  const change = changeSats / 1e8;
 
   // Outputs: order matters because lender will SIGHASH_SINGLE|ANYONECANPAY
   // input 0 → output 0 (principal). So output 0 = principal, output 1 = vault,
