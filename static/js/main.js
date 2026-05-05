@@ -2333,23 +2333,7 @@ async function openMarketPostForm(kind) {
   formEl.dataset.kind = kind;
   await renderActingInfo(me);
 
-  // For the request form, populate the collateral UTXO picker — and refresh
-  // it whenever the borrower changes collateral currency or amount.
-  if (kind === "request") {
-    const b = await balanceFor(me.iaddr);
-    const refresh = () => {
-      const ccy = formEl.querySelector('[data-f="collateral_currency"]')?.value;
-      const amt = parseFloat(formEl.querySelector('[data-f="collateral_amount"]')?.value || "0");
-      if (b.primaryR && ccy && amt > 0) populateCollateralUtxoPicker(formEl, b.primaryR, ccy, amt);
-    };
-    formEl.querySelector('[data-f="collateral_currency"]')?.addEventListener("change", refresh);
-    formEl.querySelector('[data-f="collateral_amount"]')?.addEventListener("input", () => {
-      // Debounce the input so we don't refresh per keystroke.
-      clearTimeout(formEl._utxoRefreshTimer);
-      formEl._utxoRefreshTimer = setTimeout(refresh, 400);
-    });
-    refresh();
-  }
+  // Option A: no collateral UTXO picker — split happens at preview-request time.
 }
 
 async function renderActingInfo(me) {
@@ -2381,10 +2365,7 @@ function renderRequestFormBody() {
       <label style="flex:1">Collateral amount<input type="number" data-f="collateral_amount" value="10" step="0.01" /></label>
       <label style="flex:1">Currency<select data-f="collateral_currency">${currencyOptions("VRSC")}</select></label>
     </div>
-    <div class="row">
-      <label style="flex:1">Collateral UTXO<select data-f="collateral_utxo"><option value="">— pick collateral currency first —</option></select></label>
-    </div>
-    <div class="muted" style="font-size:11px;margin-top:-4px">The committed UTXO is what the lender pre-signs settlement against. It locks until the request is matched or you cancel.</div>
+    <div class="muted" style="font-size:11px;margin-top:-4px">When you click Preview &amp; sign, the GUI auto-splits a fresh single-currency UTXO from your wallet for the collateral commitment. ~0.0001 VRSC fee.</div>
     <div class="row">
       <label style="flex:1">Repay amount<input type="number" data-f="repay_amount" value="5.05" step="0.01" /></label>
       <label style="flex:1">Term (days)<input type="number" data-f="term_days" value="30" /></label>
@@ -2561,15 +2542,52 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       return;
     }
 
-    // 3. Pick the collateral UTXO
-    const utxoStr = f("collateral_utxo");
-    if (!utxoStr || !utxoStr.includes(":")) {
-      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ Pick a collateral UTXO before previewing.</div>`;
-      previewEl.style.display = "block";
+    // 3. Option A: auto-split a fresh clean collateral UTXO via sendcurrency.
+    //    Sends `collateralAmount + 0.0001` to borrower's R, gets a single-currency
+    //    UTXO in mempool, uses it immediately (no confirmation wait — Verus
+    //    supports chained mempool).
+    previewEl.innerHTML = `<div class="review muted">Splitting a fresh ${collateralCurrency} UTXO via sendcurrency…</div>`;
+    previewEl.style.display = "block";
+    const splitAmount = collateralAmount + 0.0001;  // collateral + Tx-A fee budget
+    let splitTxid;
+    try {
+      const out = collateralCurrency === "VRSC"
+        ? [{ address: borrowerR, amount: splitAmount }]
+        : [{ currency: collateralCurrency, amount: splitAmount, address: borrowerR }];
+      const opid = await rpc("sendcurrency", [borrowerR, out]);
+      for (let i = 0; i < 30 && !splitTxid; i++) {
+        await new Promise((res) => setTimeout(res, 2000));
+        const r = await rpc("z_getoperationresult", [[opid]]);
+        const op = (r || [])[0];
+        if (op?.status === "success") splitTxid = op.result?.txid;
+        if (op?.status === "failed") throw new Error("split sendcurrency failed: " + JSON.stringify(op.error || {}));
+      }
+      if (!splitTxid) throw new Error("split sendcurrency timed out");
+    } catch (e) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ collateral split failed: ${escapeHtml(e.message)}</div>`;
       return;
     }
-    const [borrowerInputTxid, borrowerInputVoutStr] = utxoStr.split(":");
-    const borrowerInputVout = parseInt(borrowerInputVoutStr, 10);
+    // Locate the new clean UTXO in the split tx (mempool view).
+    const splitTx = await rpc("getrawtransaction", [splitTxid, 1]);
+    let borrowerInputVout = -1;
+    for (let i = 0; i < (splitTx?.vout || []).length; i++) {
+      const o = splitTx.vout[i];
+      const spk = o?.scriptPubKey || {};
+      const addrs = spk.addresses || [];
+      if (!addrs.includes(borrowerR)) continue;
+      const cv = spk.reserveoutput?.currencyvalues || {};
+      const cvKeys = Object.keys(cv);
+      if (collateralCurrency === "VRSC") {
+        if (cvKeys.length === 0 && Math.abs((o.value || 0) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
+      } else {
+        if (o.valueSat === 0 && cvKeys.length === 1 && Math.abs(parseFloat(Object.values(cv)[0]) - splitAmount) < 1e-8) { borrowerInputVout = i; break; }
+      }
+    }
+    if (borrowerInputVout < 0) {
+      previewEl.innerHTML = `<div class="review" style="color:var(--bad)">✗ split tx didn't produce a clean ${escapeHtml(collateralCurrency)} output</div>`;
+      return;
+    }
+    const borrowerInputTxid = splitTxid;
 
     // 4. Compute vault P2SH from both pubkeys
     let vault;
