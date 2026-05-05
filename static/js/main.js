@@ -1107,6 +1107,11 @@ async function loadMarket() {
   rows.sort((a, b) => (tieScore(b) - tieScore(a)) || ((b.posted_block ?? 0) - (a.posted_block ?? 0)));
 
   if (myToken !== _marketLoadToken) return; // newer load wins
+  // Skip the wholesale innerHTML replacement if any row currently has an
+  // active operation panel open (post-match, accept, etc.). Otherwise the
+  // user's mid-flight click handler ends up writing to a detached DOM node.
+  const hasActiveOp = !!el.querySelector('.post-match-panel[data-op-active="1"], .accept-panel[data-op-active="1"]');
+  if (hasActiveOp) return;
   el.innerHTML = rows.map(render).join("");
 
   // For matches: enrich each row with the linked request's terms + lender's R-balance.
@@ -1561,6 +1566,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const r = requestByKey.get(requestKey);
     const panel = row.querySelector(".post-match-panel");
     panel.style.display = "block";
+    panel.dataset.opActive = "1";   // marker so loadMarket can skip clobbering
     panel.innerHTML = `<div class="review muted">looking up your funding options…</div>`;
     try {
       let acting = actingIaddr();
@@ -2011,6 +2017,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     const matchKey = row.dataset.matchKey;
     const r = matchByKey.get(matchKey);
     const panel = row.querySelector(".accept-panel");
+    panel.dataset.opActive = "1";
     const resultEl = panel.querySelector(".accept-result") || panel;
     btn.disabled = true; btn.textContent = "Verifying match…";
     try {
