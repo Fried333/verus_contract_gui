@@ -1746,24 +1746,51 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           ? [{ address: lenderR, amount: principalAmt }]
           : [{ currency: principalCcy, amount: principalAmt, address: lenderR }];
         const opid = await rpc("sendcurrency", [lenderR, out]);
-        let txid = null;
-        for (let i = 0; i < 30 && !txid; i++) {
+        let splitTxid = null;
+        for (let i = 0; i < 30 && !splitTxid; i++) {
           await new Promise((r) => setTimeout(r, 2000));
           const res = await rpc("z_getoperationresult", [[opid]]);
           const op = (res || [])[0];
-          if (op?.status === "success") txid = op.result?.txid;
+          if (op?.status === "success") splitTxid = op.result?.txid;
           if (op?.status === "failed") throw new Error("split sendcurrency failed: " + JSON.stringify(op.error || {}));
         }
-        if (!txid) throw new Error("split sendcurrency timed out");
-        btn.textContent = "Waiting for split tx to confirm…";
-        for (let i = 0; i < 60; i++) {
-          await new Promise((r) => setTimeout(r, 5000));
-          const ginfo = await rpc("gettransaction", [txid]).catch(() => null);
-          if ((ginfo?.confirmations ?? 0) >= 1) break;
+        if (!splitTxid) throw new Error("split sendcurrency timed out");
+        // Don't wait for confirmation — Verus supports chained mempool. Decode
+        // the split tx from the local mempool to find the new clean output.
+        btn.textContent = "Locating split output in mempool (no confirm wait)…";
+        const splitTx = await rpc("getrawtransaction", [splitTxid, 1]);
+        if (!splitTx) throw new Error("split tx not visible to local daemon yet");
+        // Find the single-currency output going back to lenderR with the right amount.
+        let splitVout = -1;
+        for (let i = 0; i < (splitTx.vout || []).length; i++) {
+          const o = splitTx.vout[i];
+          const spk = o?.scriptPubKey || {};
+          const addrs = spk.addresses || [];
+          if (!addrs.includes(lenderR)) continue;
+          const cv = spk.reserveoutput?.currencyvalues || {};
+          const cvKeys = Object.keys(cv);
+          if (principalCcy !== "VRSC") {
+            // Cryptocondition output, single currency, exact amount
+            if (o.valueSat === 0 && cvKeys.length === 1 && parseFloat(Object.values(cv)[0]) === principalAmt) {
+              splitVout = i; break;
+            }
+          } else {
+            // VRSC P2PKH output of exactly the principal amount
+            if (o.valueSat === principalSats && cvKeys.length === 0) {
+              splitVout = i; break;
+            }
+          }
         }
-        utxos = await rpc("getaddressutxos", [{ addresses: [lenderR], currencynames: true }]);
-        exact = findExact();
-        if (!exact) throw new Error("split confirmed but no exact-amount UTXO appeared");
+        if (splitVout < 0) throw new Error("split tx didn't produce a clean single-currency output");
+        // Synthesize a UTXO record matching what getaddressutxos would return.
+        const splitOut = splitTx.vout[splitVout];
+        exact = {
+          txid: splitTxid,
+          outputIndex: splitVout,
+          satoshis: splitOut.valueSat,
+          currencyvalues: splitOut.scriptPubKey?.reserveoutput?.currencyvalues || {},
+          script: splitOut.scriptPubKey?.hex,
+        };
       }
 
       btn.textContent = "Extending borrower's Tx-A skeleton…";
