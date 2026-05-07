@@ -1282,16 +1282,20 @@ async function loadMarket() {
       return true;
     });
 
-    // Dedupe: any matched-state loan in Active shouldn't also appear as a
-    // raw match row in "Awaiting counterparty" — they're the same loan
-    // thread. /loans/matches doesn't expose tx_a_txid flat, so we dedupe
-    // by counterparty: lender matches one borrower per loan thread, and
-    // matched-state active rows carry counterparty_iaddr (the borrower).
-    const activeMatchedBorrowers = new Set(
-      activeRows.filter((l) => l.state === 'matched').map((l) => l.counterparty_iaddr).filter(Boolean)
+    // Dedupe: any of our own matches that's already in the Active section
+    // shouldn't also appear as a raw match row in "Awaiting counterparty".
+    // Includes BOTH 'matched' (borrower hasn't broadcast Tx-A yet) AND
+    // 'active' (Tx-A confirmed, loan running) — both are the same thread.
+    // /loans/matches doesn't expose tx_a_txid flat so we dedupe by
+    // counterparty_iaddr (the borrower).
+    const activeBorrowers = new Set(
+      activeRows
+        .filter((l) => l.role === 'lender' && (l.state === 'matched' || l.state === 'active'))
+        .map((l) => l.counterparty_iaddr)
+        .filter(Boolean)
     );
-    if (activeMatchedBorrowers.size > 0) {
-      myMchs = myMchs.filter((m) => !activeMatchedBorrowers.has(m.request?.iaddr));
+    if (activeBorrowers.size > 0) {
+      myMchs = myMchs.filter((m) => !activeBorrowers.has(m.request?.iaddr));
     }
 
     // Counts for the Loans tab badge — actionable items only.
@@ -3973,13 +3977,28 @@ async function loadLoans(targetEl) {
   // Skip wholesale re-render if any card has an active op panel open —
   // otherwise the repay handler ends up writing to a detached node.
   if (el.querySelector('.mp-row[data-op-active="1"]')) return;
-  el.innerHTML = flat.map(renderActiveLoan).join("");
+  // Tip height drives the Claim collateral lockout — lender can only
+  // sweep the vault via Tx-B once tipHeight ≥ maturity_block.
+  const tipHeight = await rpc("getblockcount", []).catch(() => 0);
+  el.innerHTML = flat.map((r) => renderActiveLoan(r, tipHeight)).join("");
   enrichActiveLoanBalances();
 }
 
-function renderActiveLoan(r) {
+function renderActiveLoan(r, tipHeight) {
   const hasRepay = r.role === "borrower" && r.tx_repay_local;
   const isMatched = r.state === "matched";
+  // Lender's collateral-claim window: only after maturity_block has been
+  // reached. Before that, Tx-B's nLockTime won't be valid yet — the
+  // network would reject it. Show the countdown instead of a dead button.
+  const tip = tipHeight || 0;
+  const maturity = r.maturity_block || 0;
+  const blocksToMaturity = maturity - tip;
+  const isLender = r.role === "lender";
+  const claimable = isLender && maturity > 0 && tip >= maturity;
+  const minutesPerBlock = 1; // Verus ~60s blocks
+  const eta = blocksToMaturity > 0
+    ? `~${Math.round(blocksToMaturity * minutesPerBlock / 1440 * 10) / 10} days`
+    : null;
   return `
     <div class="card mp-row" data-loan-id="${escapeHtml(r.loan_id || r.tx_a_txid || "")}" data-repay-currency="${escapeHtml(r.repay?.currency || "")}" data-repay-amount="${escapeHtml(r.repay?.amount ?? "")}">
       <div class="row">
@@ -3995,7 +4014,7 @@ function renderActiveLoan(r) {
         <div><span class="k">collateral</span><span class="v">${formatAmount(r.collateral)}</span></div>
         <div><span class="k">repay</span><span class="v">${formatAmount(r.repay)}</span></div>
         ${!isMatched ? `<div><span class="k">your balance</span><span class="v repay-balance muted">checking…</span></div>` : ""}
-        <div><span class="k">maturity</span><span class="v">${isMatched ? "—" : `block ${r.maturity_block ?? "?"}`}</span></div>
+        <div><span class="k">maturity</span><span class="v">${isMatched ? "—" : `block ${r.maturity_block ?? "?"}${eta ? ` <span class="muted">· ${blocksToMaturity} blocks (${eta}) to go</span>` : (claimable ? ` <span style="color:var(--ok)">· reached</span>` : "")}`}</span></div>
         <div><span class="k">loan_id</span><span class="v"><code>${escapeHtml((r.loan_id || "—").slice(0, 20))}…</code></span></div>
       </div>
       <div class="row" style="margin-top:10px;gap:8px">
@@ -4007,7 +4026,11 @@ function renderActiveLoan(r) {
             ? `<button class="primary" data-loan-act="repay">Repay</button>
                <span class="muted" style="font-size:11px;margin-left:8px">Auto-splits a fresh repayment UTXO + extends Tx-Repay + broadcasts. Then posts loan.history (settled).</span>`
             : `<button class="primary" disabled title="Tx-Repay not in this browser's localStorage — accept on this device or import the template">Repay</button>`
-          : `<button class="primary" disabled title="After maturity, GUI fetches Tx-B from borrower's loan.status, extends, broadcasts">Claim collateral</button>`}
+          : claimable
+            ? `<button class="primary" disabled title="GUI Tx-B claim flow not yet wired — for now broadcast Tx-B manually via the SPEC's recipe (lender extends pre-signed Tx-B with their input, signs, sendrawtransaction)">Claim collateral (manual — see SPEC)</button>
+               <span style="color:var(--ok);font-size:11px;align-self:center">Maturity reached.</span>`
+            : `<button class="primary" disabled title="Tx-B's nLockTime is set to the maturity block; the network rejects it until tipHeight ≥ maturity">Collateral not claimable until block ${maturity || "?"}</button>
+               ${eta ? `<span class="muted" style="font-size:11px;align-self:center">~${blocksToMaturity} blocks (${eta}) to go</span>` : ""}`}
       </div>
       <div class="repay-result" style="margin-top:8px"></div>
     </div>
