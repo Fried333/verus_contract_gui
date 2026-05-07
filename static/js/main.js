@@ -36,13 +36,44 @@ function currencyOptions(selected = "VRSC") {
   return CURRENCIES.map((c) => `<option value="${c}"${c === selected ? " selected" : ""}>${c}</option>`).join("");
 }
 
+// VDXF key transition: vrsc::contract.* → vcs::contract.*
+//
+// New (active write) keys — what new entries get posted under from now on.
+// Legacy keys — what entries were posted under before the rename. Reads on
+// the History tab consult BOTH so past loans keep surfacing; reads on
+// Marketplace / Active Loans look only at the new keys (nothing live
+// remains under the legacy keys).
+const VDXF_LOAN_REQUEST  = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW"; // vcs::contract.loan.request
+const VDXF_LOAN_MATCH    = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt"; // vcs::contract.loan.match
+const VDXF_LOAN_STATUS   = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j"; // vcs::contract.loan.status
+const VDXF_LOAN_HISTORY  = "iBGuPDeeHHYpvKdM7VG2d7LR1Lct9itcpT"; // vcs::contract.loan.history
+
+const VDXF_LOAN_REQUEST_LEGACY = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+const VDXF_LOAN_MATCH_LEGACY   = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+const VDXF_LOAN_STATUS_LEGACY  = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+const VDXF_LOAN_HISTORY_LEGACY = "i92jad9CSjBNPCHgnHqQP4hK1facXBFDWb";
+
+// Read-set: new + legacy. Iterate to surface entries posted under either.
+const VDXF_LOAN_REQUEST_KEYS = [VDXF_LOAN_REQUEST, VDXF_LOAN_REQUEST_LEGACY];
+const VDXF_LOAN_MATCH_KEYS   = [VDXF_LOAN_MATCH,   VDXF_LOAN_MATCH_LEGACY];
+const VDXF_LOAN_STATUS_KEYS  = [VDXF_LOAN_STATUS,  VDXF_LOAN_STATUS_LEGACY];
+const VDXF_LOAN_HISTORY_KEYS = [VDXF_LOAN_HISTORY, VDXF_LOAN_HISTORY_LEGACY];
+
 const VDXF = {
   "iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY": { slug: "loan.offer",    label: "Loan offer" },
-  "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28": { slug: "loan.request",  label: "Loan request" },
-  "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT": { slug: "loan.match",    label: "Loan match" },
-  "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys": { slug: "loan.status",   label: "Loan active" },
-  "i4a42EUWLvJTHYGW7F8RifY1Rvs5AQGioY": { slug: "option.offer",  label: "Option offer" },
-  "iDE4csgPBx9Rn7H4zkn4VhSShcxcwmknQo": { slug: "option.request",label: "Option request" },
+  // Active (vcs::contract.*) — written by current code.
+  [VDXF_LOAN_REQUEST]:                   { slug: "loan.request",  label: "Loan request" },
+  [VDXF_LOAN_MATCH]:                     { slug: "loan.match",    label: "Loan match" },
+  [VDXF_LOAN_STATUS]:                    { slug: "loan.status",   label: "Loan active" },
+  [VDXF_LOAN_HISTORY]:                   { slug: "loan.history",  label: "Loan settled" },
+  // Legacy (vrsc::contract.*) — read-only, kept so historical entries label
+  // correctly in the UI.
+  [VDXF_LOAN_REQUEST_LEGACY]:            { slug: "loan.request",  label: "Loan request (legacy)" },
+  [VDXF_LOAN_MATCH_LEGACY]:              { slug: "loan.match",    label: "Loan match (legacy)" },
+  [VDXF_LOAN_STATUS_LEGACY]:             { slug: "loan.status",   label: "Loan active (legacy)" },
+  [VDXF_LOAN_HISTORY_LEGACY]:            { slug: "loan.history",  label: "Loan settled (legacy)" },
+  "i4a42EUWLvJTHYGW7F8RifY1Rvs5AQGioY":  { slug: "option.offer",  label: "Option offer" },
+  "iDE4csgPBx9Rn7H4zkn4VhSShcxcwmknQo":  { slug: "option.request",label: "Option request" },
 };
 
 // ---------- helpers ----------
@@ -237,7 +268,7 @@ async function getPubkeyForRAddress(rAddr) {
 // originating tx and decoding the contentmultimap update. Used as a fallback
 // when scan.verus.cx is rate-limiting the explorer API.
 async function fetchRequestFromLocalDaemon(txid) {
-  const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+  const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
   const tx = await rpc("getrawtransaction", [txid, 1]);
   // The identity update is in tx.vout — find the one that has an identity
   // primary output and pull the contentmultimap from its scriptPubKey.
@@ -684,7 +715,7 @@ document.getElementById("ids-list")?.addEventListener("click", async (ev) => {
   let payload, vdxfId, slug;
   if (do_ === "preview-request") {
     slug = "loan.request";
-    vdxfId = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+    vdxfId = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
     const principalCurrency = f("principal_currency");
     payload = {
       version: 1,
@@ -1141,12 +1172,41 @@ async function loadMarket() {
         }
       }
     } catch {}
+    // If the acting lender already has an active loan.match for a given
+    // borrower, suppress that borrower's pending request from "Awaiting
+    // your action" — they've already committed; the request shouldn't
+    // appear actionable. Walks the lender's loan.match entries directly
+    // via daemon (NOT /loans/by-party) so it catches orphan matches whose
+    // request_txid points to a now-replaced version of the request.
+    const matchedWithBorrowers = new Set();
+    const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+    for (const ia of partyAddrs) {
+      try {
+        const info = await rpc("getidentity", [ia, -1]);
+        const cm = info?.identity?.contentmultimap || {};
+        for (const e of (cm[VDXF_LOAN_MATCH] || [])) {
+          const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+          if (!hex) continue;
+          try {
+            const m = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+            if (m?.active === false) continue;
+            // Skip matches whose Tx-A has already opened — those are
+            // active loans, separate filter (acceptedTxAtxids) handles them.
+            if (m?.tx_a_txid && acceptedTxAtxids.has(m.tx_a_txid)) continue;
+            if (m?.request?.iaddr) matchedWithBorrowers.add(m.request.iaddr);
+          } catch {}
+        }
+      } catch {}
+    }
 
     // Pending requests directed at me as lender — these need my action.
+    // Skip if I already have a matched/active loan with this borrower —
+    // that case is "waiting on borrower," not "awaiting my action."
     const reqsAtMe = (reqRes.results || []).filter((r) =>
       r.target_lender_iaddr && mySet.has(r.target_lender_iaddr) &&
       !mySet.has(r.iaddr) &&
-      !matchedRequestTxids.has(r.posted_tx)
+      !matchedRequestTxids.has(r.posted_tx) &&
+      !matchedWithBorrowers.has(r.iaddr)
     );
     // My own requests waiting for a lender match.
     const myReqs = (reqRes.results || []).filter((r) =>
@@ -1160,7 +1220,7 @@ async function loadMarket() {
       !acceptedRequestTxids.has(r.request?.txid) && !acceptedTxAtxids.has(r.tx_a_txid)
     );
     // My posted matches (I'm lender, waiting for borrower to accept).
-    const myMchs = (mchRes.results || []).filter((r) =>
+    let myMchs = (mchRes.results || []).filter((r) =>
       mySet.has(r.match_iaddr) && !acceptedTxAtxids.has(r.tx_a_txid)
     );
 
@@ -1176,6 +1236,18 @@ async function loadMarket() {
       seenLoanIds.add(id);
       return true;
     });
+
+    // Dedupe: any matched-state loan in Active shouldn't also appear as a
+    // raw match row in "Awaiting counterparty" — they're the same loan
+    // thread. /loans/matches doesn't expose tx_a_txid flat, so we dedupe
+    // by counterparty: lender matches one borrower per loan thread, and
+    // matched-state active rows carry counterparty_iaddr (the borrower).
+    const activeMatchedBorrowers = new Set(
+      activeRows.filter((l) => l.state === 'matched').map((l) => l.counterparty_iaddr).filter(Boolean)
+    );
+    if (activeMatchedBorrowers.size > 0) {
+      myMchs = myMchs.filter((m) => !activeMatchedBorrowers.has(m.request?.iaddr));
+    }
 
     // Counts for the Loans tab badge — actionable items only.
     const actionCount = matchesAtMe.length + reqsAtMe.length;
@@ -1248,6 +1320,10 @@ async function loadMarket() {
         });
       });
     }
+    // Enrich match rows in this branch too (terms + R balance). The
+    // tail-of-loadMarket call only fires for legacy tabs; this branch
+    // returns early.
+    enrichMatchRows(myToken);
     return;
   }
 
@@ -1459,7 +1535,7 @@ async function loadMarket() {
 
   // For matches: enrich each row with the linked request's terms + lender's R-balance.
   // Pass myToken so each enrichment can bail if a newer load fires mid-fetch.
-  if (mpTab === "matches") enrichMatchRows(myToken);
+  if (mpTab === "matches" || mpTab === "loans" || mpTab === "inbox") enrichMatchRows(myToken);
 }
 
 async function enrichMatchRows(token) {
@@ -1467,7 +1543,10 @@ async function enrichMatchRows(token) {
   for (const rowEl of rowEls) {
     const r = matchByKey.get(rowEl.dataset.matchKey);
     if (!r) continue;
-    enrichMatchRowTerms(rowEl, r, token);
+    // Terms first — sets dataset.collateralCurrency / repayCurrency /
+    // principalCurrency, which the balance enrichment then uses to
+    // filter out unrelated currencies.
+    await enrichMatchRowTerms(rowEl, r, token);
     enrichMatchRowBalance(rowEl, r, token);
   }
 }
@@ -1607,9 +1686,13 @@ async function enrichMatchRowTerms(rowEl, r, token) {
   // can reuse it after subsequent loadMarket re-renders.
   const mKey = `match-${r.match_iaddr}-${r.posted_tx || ""}`;
   matchResolvedRequest.set(mKey, req);
-  // Stash collateral currency on the row for the balance enrichment
+  // Stash currencies on the row so the balance enrichment can filter to
+  // just the loan's currencies (collateral + repay for borrower; principal
+  // for lender).
   rowEl.dataset.collateralCurrency = req.collateral?.currency || "";
-  rowEl.dataset.collateralAmount = String(req.collateral?.amount ?? "");
+  rowEl.dataset.collateralAmount   = String(req.collateral?.amount ?? "");
+  rowEl.dataset.repayCurrency      = req.repay?.currency || "";
+  rowEl.dataset.principalCurrency  = req.principal?.currency || "";
   // Once terms are ready, refresh borrower balance check
   enrichBorrowerCollateralBalance(rowEl, r, token);
 }
@@ -1617,22 +1700,58 @@ async function enrichMatchRowTerms(rowEl, r, token) {
 async function enrichMatchRowBalance(rowEl, r, token) {
   const cell = rowEl.querySelector(".balance-cell");
   if (!cell) return;
-  // If the borrower is the acting identity, show THEIR R balance instead of
-  // the lender's — the lender's balance isn't useful from the borrower's POV.
+  // If the borrower is the acting identity, the contextual
+  // "✓/✗ Your wallet has X collateral" note (appended by
+  // enrichBorrowerCollateralBalance to .match-terms) already
+  // tells them whether they have enough — listing all wallet
+  // balances here is redundant noise. Hide the row entirely.
   const acting = actingIaddr();
   const actingIsBorrower = acting && acting !== "all" && r.request?.iaddr === acting;
-  let address = r.lender_address;
   if (actingIsBorrower) {
-    try {
-      const info = await rpc("getidentity", [acting, -1]);
-      address = (info?.identity?.primaryaddresses || [])[0] || null;
-    } catch {}
+    const lenderRow = cell.closest(".lender-row");
+    if (lenderRow) lenderRow.style.display = "none";
+    return;
   }
+  let address = r.lender_address;
   if (!address) return;
+  // Restrict the displayed balances to currencies relevant to this loan:
+  //   - borrower side: collateral (what they commit) + repay (what they
+  //     pay back). Skips noise like "you have 0.49 VRSC" when neither
+  //     side of the loan is in VRSC.
+  //   - lender side:   principal (what they fund). The lender's other
+  //     balances aren't useful from the borrower's POV.
+  const loanCcyIds = new Set();
+  const loanCcyNames = new Set();
+  const collCcy = rowEl.dataset.collateralCurrency;
+  const repayCcy = rowEl.dataset.repayCurrency;
+  const principalCcy = rowEl.dataset.principalCurrency;
+  if (actingIsBorrower) {
+    if (collCcy)  loanCcyNames.add(collCcy);
+    if (repayCcy) loanCcyNames.add(repayCcy);
+  } else {
+    if (principalCcy) loanCcyNames.add(principalCcy);
+  }
+  // Map currency names to known i-addresses so we can match the keys
+  // returned by getaddressbalance (which are i-addresses, not names).
+  const NAME_TO_ID = {
+    "VRSC": "i5w5MuNik5NtLcYmNzcvaoixooEebB6MGV",
+    "DAI.vETH": "iGBs4DWztRNvNEJBt4mqHszLxfKTNHTkhM",
+    "vETH": "iCkKJuJScy4Z6NSDK7Mt42ZAB2NEnAE1o4",
+  };
+  for (const name of loanCcyNames) {
+    if (NAME_TO_ID[name]) loanCcyIds.add(NAME_TO_ID[name]);
+  }
   let result, error;
   try {
     const bal = await rpc("getaddressbalance", [{ addresses: [address] }]);
-    result = `<code>${escapeHtml(address)}</code> · ${fmtBalances(bal?.currencybalance || { VRSC: (bal?.balance ?? 0) / 1e8 })}`;
+    const cb = bal?.currencybalance || { [NAME_TO_ID.VRSC]: (bal?.balance ?? 0) / 1e8 };
+    const filtered = {};
+    for (const [k, v] of Object.entries(cb)) {
+      if (loanCcyIds.size === 0 || loanCcyIds.has(k) || loanCcyNames.has(k)) {
+        filtered[k] = v;
+      }
+    }
+    result = `<code>${escapeHtml(address)}</code> · ${fmtBalances(filtered)}`;
   } catch (e) {
     error = e.message;
   }
@@ -1709,7 +1828,7 @@ function renderMarketRequest(r, mySet, myMap, acting) {
   const requestKey = `req-${r.iaddr}-${r.posted_tx || ""}`;
   requestByKey.set(requestKey, r);
   return `
-    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28" data-request-key="${escapeHtml(requestKey)}">
+    <div class="card mp-row" data-iaddr="${escapeHtml(r.iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW" data-request-key="${escapeHtml(requestKey)}">
       <div class="row">
         <strong style="flex:1">${escapeHtml(r.fullyQualifiedName || r.name + "@")}</strong>
         <span class="badge loan-request">Loan request</span>
@@ -1807,7 +1926,7 @@ function renderMarketMatch(r, mySet, myMap, acting) {
   const matchKey = `match-${r.match_iaddr}-${r.posted_tx || ""}`;
   matchByKey.set(matchKey, r);
   return `
-    <div class="card mp-row" data-iaddr="${escapeHtml(r.match_iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT" data-match-key="${escapeHtml(matchKey)}">
+    <div class="card mp-row" data-iaddr="${escapeHtml(r.match_iaddr)}" data-name="${escapeHtml(me?.name || "")}" data-parent="${escapeHtml(me?.parent || "")}" data-vdxf="i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt" data-match-key="${escapeHtml(matchKey)}">
       <div class="row">
         <strong style="flex:1">From <span style="color:var(--accent)">${escapeHtml(r.fullyQualifiedName || r.name + "@")}</span></strong>
         <span class="badge loan-match">Loan match</span>
@@ -2096,7 +2215,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // signed Tx-A skeleton, so we have to read it directly).
       const borrowerInfo = await rpc("getidentity", [r.iaddr, -1]);
       try {
-        const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+        const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
         const cm = borrowerInfo?.identity?.contentmultimap || {};
         const entries = cm[VDXF_LOAN_REQUEST] || [];
         for (const e of entries) {
@@ -2312,6 +2431,17 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
           }
         }
         if (splitVout < 0) throw new Error("split tx didn't produce a clean single-currency output");
+        // Reserve the freshly-split UTXO via lockunspent so no other
+        // wallet operation accidentally consumes it before Tx-A
+        // broadcasts. Without this, subsequent sendcurrency / repay /
+        // consolidate could pick this UTXO as input, invalidating the
+        // pre-signed Tx-A. The lock is in-memory; on cancel we unlock,
+        // on Tx-A broadcast it's spent naturally.
+        try {
+          await rpc("lockunspent", [false, [{ txid: splitTxid, vout: splitVout }]]);
+        } catch (e) {
+          console.warn("lockunspent failed (non-fatal):", e?.message);
+        }
         // Synthesize a UTXO record matching what getaddressutxos would return.
         const splitOut = splitTx.vout[splitVout];
         exact = {
@@ -2433,7 +2563,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
 
       // Read existing multimap entries on lender's identity to merge with our new one.
       const existing = (lenderInfoCache.get(acting) || (await rpc("getidentity", [acting, -1])).identity)?.contentmultimap || {};
-      const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+      const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
       const newMultimap = { ...existing };
       // Normalize preserved entries to hex strings (defensive — see
       // accept-v2 for context).
@@ -2517,7 +2647,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     // multimap entry from the lender's iaddr so we know which UI flow to show.
     try {
       const lenderInfo = await rpc("getidentity", [r.match_iaddr, -1]);
-      const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+      const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
       const cm = lenderInfo?.identity?.contentmultimap || {};
       const entries = cm[VDXF_LOAN_MATCH] || [];
       for (const e of entries) {
@@ -2577,7 +2707,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       // Re-fetch the raw multimap entry from the lender's iaddr to get them.
       try {
         const lenderInfo = await rpc("getidentity", [r.match_iaddr, -1]);
-        const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+        const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
         const cm = lenderInfo?.identity?.contentmultimap || {};
         const entries = cm[VDXF_LOAN_MATCH] || [];
         for (const e of entries) {
@@ -2674,7 +2804,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       btn.textContent = "Posting Tx-B + loan.status to your VerusID…";
       const idInfo = await rpc("getidentity", [acting, -1]);
       const existing = idInfo?.identity?.contentmultimap || {};
-      const VDXF_LOAN_STATUS = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+      const VDXF_LOAN_STATUS = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
       const statusPayload = {
         version: 3,
         role: "borrower",
@@ -2715,6 +2845,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         });
       }
       newCm[VDXF_LOAN_STATUS] = [...(newCm[VDXF_LOAN_STATUS] || []), statusHex];
+      // Consume the loan.request: this updateidentity is the moment the
+      // request transitions from "intent" to "active loan." Dropping the
+      // entry atomically with adding loan.status keeps the borrower's
+      // multimap reflecting current truth and removes the stale request
+      // from lender-side discovery views.
+      const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
+      delete newCm[VDXF_LOAN_REQUEST];
       const updateTxid = await rpc("updateidentity", [{
         name: idInfo.identity.name,
         parent: idInfo.identity.parent || "",
@@ -2840,6 +2977,12 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
     try {
       const info = await rpc("getidentity", [iaddr, -1]);
       const cm = info?.identity?.contentmultimap || {};
+      // Best-effort: unlock any UTXOs reserved for the entries we're
+      // about to drop. Releases the wallet's hold on principal/collateral
+      // funding inputs that were locked at request/match-post time.
+      for (const oldEntry of (cm[vdxfId] || [])) {
+        await unlockEntryUtxos(vdxfId, oldEntry);
+      }
       const newCm = {};
       for (const [k, v] of Object.entries(cm)) {
         if (k === vdxfId) continue;
@@ -2868,6 +3011,31 @@ document.getElementById("market-refresh").onclick = async () => {
   await populateActingPicker();
   loadMarket();
 };
+
+// Decode a multimap entry payload and unlock any UTXOs the entry's
+// pre-signed transactions reference (best-effort; failures are silent).
+// Used when cancelling a loan.request or loan.match — the underlying
+// principal/collateral funding inputs were lockunspent at post time and
+// need to be released so the wallet can reuse them.
+async function unlockEntryUtxos(vdxfId, entry) {
+  try {
+    const hex = typeof entry === "string" ? entry : (entry?.serializedhex || entry?.message || "");
+    if (!hex) return;
+    const payload = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+    const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
+    const VDXF_LOAN_MATCH   = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+    const txHex = vdxfId === VDXF_LOAN_REQUEST ? payload.borrower_input_signed_hex
+                : vdxfId === VDXF_LOAN_MATCH   ? payload.tx_a_full
+                : null;
+    if (!txHex) return;
+    const decoded = await rpc("decoderawtransaction", [txHex]).catch(() => null);
+    const vin = decoded?.vin?.[0];
+    if (!vin?.txid || typeof vin.vout !== "number") return;
+    await rpc("lockunspent", [true, [{ txid: vin.txid, vout: vin.vout }]]).catch(() => {});
+  } catch (e) {
+    console.warn("unlockEntryUtxos:", e?.message);
+  }
+}
 
 // Cache spendable identities for the ID picker. Includes primaryR so we
 // don't need a per-ID getidentity RPC for grouping.
@@ -3133,7 +3301,7 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
   let slug, vdxfId, payload;
   if (action === "preview-request") {
     slug = "loan.request";
-    vdxfId = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
+    vdxfId = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
     const principalCurrency = f("principal_currency");
     const collateralCurrency = f("collateral_currency");
     const principalAmount = parseFloat(f("principal_amount"));
@@ -3226,6 +3394,16 @@ document.getElementById("mp-post-form").addEventListener("click", async (ev) => 
       return;
     }
     const borrowerInputTxid = splitTxid;
+    // Reserve the freshly-split UTXO via lockunspent so no other wallet
+    // operation accidentally consumes it before Tx-A broadcasts. Without
+    // this, the borrower's pre-signed Tx-A input could be invalidated by
+    // a subsequent sendcurrency / consolidate. Lock is in-memory; on
+    // request cancel we unlock, on Tx-A broadcast it's spent naturally.
+    try {
+      await rpc("lockunspent", [false, [{ txid: borrowerInputTxid, vout: borrowerInputVout }]]);
+    } catch (e) {
+      console.warn("lockunspent failed (non-fatal):", e?.message);
+    }
 
     // 4. Compute vault P2SH from both pubkeys
     let vault;
@@ -3339,10 +3517,10 @@ let pendingMarketBroadcast = null;
 // explorer API.
 async function fetchActiveLoansFromDaemon(actingIa) {
   if (!actingIa || actingIa === "all") return [];
-  const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
-  const VDXF_LOAN_MATCH   = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
-  const VDXF_LOAN_STATUS  = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
-  const VDXF_LOAN_HISTORY = "i92jad9CSjBNPCHgnHqQP4hK1facXBFDWb";
+  const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
+  const VDXF_LOAN_MATCH   = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+  const VDXF_LOAN_STATUS  = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
+  const VDXF_LOAN_HISTORY = "iBGuPDeeHHYpvKdM7VG2d7LR1Lct9itcpT";
 
   const decode = (e) => {
     const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
@@ -3493,7 +3671,7 @@ async function loadLoans(targetEl) {
     let info;
     try { info = await rpc("getidentity", [ia, -1]); } catch { continue; }
     const cm = info?.identity?.contentmultimap || {};
-    const VDXF_LOAN_STATUS = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+    const VDXF_LOAN_STATUS = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
     for (const e of (cm[VDXF_LOAN_STATUS] || [])) {
       const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
       if (!hex) continue;
@@ -3570,9 +3748,10 @@ function renderActiveLoan(r) {
         <div><span class="k">maturity</span><span class="v">${isMatched ? "—" : `block ${r.maturity_block ?? "?"}`}</span></div>
         <div><span class="k">loan_id</span><span class="v"><code>${escapeHtml((r.loan_id || "—").slice(0, 20))}…</code></span></div>
       </div>
-      <div class="row" style="margin-top:10px">
+      <div class="row" style="margin-top:10px;gap:8px">
         ${isMatched
-          ? `<span class="muted" style="font-size:12px">Match posted — borrower's auto-accept will broadcast Tx-A within ~30s. Loan opens self-settling.</span>`
+          ? `<button class="ghost remove-btn" data-loan-act="cancel-match" data-counterparty-iaddr="${escapeHtml(r.counterparty_iaddr || '')}" style="flex:0 0 auto">Cancel match</button>
+             <span class="muted" style="font-size:11px;align-self:center">Borrower's auto-accept broadcasts Tx-A within ~30s. Cancel only if you want to withdraw your commitment before they do.</span>`
           : r.role === "borrower"
           ? hasRepay
             ? `<button class="primary" data-loan-act="repay">Repay</button>
@@ -3669,6 +3848,67 @@ async function enrichActiveLoanBalances() {
   card.dataset.opActive = "1";
   const resultEl = card.querySelector(".repay-result");
 
+  if (btn.dataset.loanAct === "cancel-match") {
+    if (!confirm("Cancel your loan.match for this borrower? Your pre-signed partials will be withdrawn from chain.")) {
+      delete card.dataset.opActive;
+      return;
+    }
+    btn.disabled = true; btn.textContent = "Cancelling…";
+    resultEl.innerHTML = `<div class="muted" style="font-size:12px">Posting updateidentity to drop the loan.match entry — this typically takes 5-10 seconds for mempool propagation…</div>`;
+    try {
+      const acting = actingIaddr();
+      if (!acting || acting === "all") throw new Error("set acting identity first");
+      const idInfo = await rpc("getidentity", [acting, -1]);
+      const existing = idInfo?.identity?.contentmultimap || {};
+      const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+      const counterpartyIa = btn.dataset.counterpartyIaddr || "";
+      // Drop any active match where request.iaddr matches the borrower
+      // we're cancelling against. Other matches (different borrowers)
+      // are preserved.
+      const newCm = { ...existing };
+      const allEntries = newCm[VDXF_LOAN_MATCH] || [];
+      const kept = [];
+      for (const e of allEntries) {
+        const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+        if (!hex) { kept.push(e); continue; }
+        let toCancel = false;
+        try {
+          const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+          toCancel = j?.request?.iaddr === counterpartyIa;
+        } catch {}
+        if (toCancel) {
+          // Release the lender's principal funding UTXO so the wallet can
+          // reuse it. Match's pre-signatures become void after cancellation.
+          await unlockEntryUtxos(VDXF_LOAN_MATCH, e);
+        } else {
+          kept.push(e);
+        }
+      }
+      if (kept.length === 0) delete newCm[VDXF_LOAN_MATCH];
+      else newCm[VDXF_LOAN_MATCH] = kept;
+      // Normalize all preserved entries to hex strings.
+      for (const [k, v] of Object.entries(newCm)) {
+        newCm[k] = (Array.isArray(v) ? v : [v]).map((entry) => {
+          if (typeof entry === "string") return entry;
+          return entry?.serializedhex || entry?.message || JSON.stringify(entry);
+        });
+      }
+      const txid = await rpc("updateidentity", [{
+        name: idInfo.identity.name,
+        parent: idInfo.identity.parent || "",
+        contentmultimap: newCm,
+      }]);
+      resultEl.innerHTML = `<div class="muted" style="color:var(--ok)">✓ Match cancelled: <a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(txid)}" target="_blank"><code>${escapeHtml(txid.slice(0,16))}…</code></a></div>`;
+      invalidateMarketCache();
+      setTimeout(() => { delete card.dataset.opActive; loadMarket(); }, 3000);
+    } catch (e) {
+      resultEl.innerHTML = `<div class="muted" style="color:var(--bad)">✗ ${escapeHtml(e.message)}</div>`;
+      btn.disabled = false; btn.textContent = "Cancel match";
+      delete card.dataset.opActive;
+    }
+    return;
+  }
+
   if (btn.dataset.loanAct === "repay") {
     btn.disabled = true; btn.textContent = "Loading Tx-Repay…";
     try {
@@ -3677,7 +3917,7 @@ async function enrichActiveLoanBalances() {
       const acting = actingIaddr();
       const idInfo = await rpc("getidentity", [acting, -1]);
       const cm = idInfo?.identity?.contentmultimap || {};
-      const VDXF_LOAN_STATUS = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+      const VDXF_LOAN_STATUS = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
       let status = null;
       for (const e of (cm[VDXF_LOAN_STATUS] || [])) {
         const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
@@ -3711,7 +3951,7 @@ async function enrichActiveLoanBalances() {
         if (!lenderIa) throw new Error("loan.status missing match_iaddr — can't recover Tx-Repay from chain");
         const lenderInfo = await rpc("getidentity", [lenderIa, -1]);
         const lcm = lenderInfo?.identity?.contentmultimap || {};
-        const VDXF_LOAN_MATCH = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
+        const VDXF_LOAN_MATCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
         let matchPayload = null;
         for (const e of (lcm[VDXF_LOAN_MATCH] || [])) {
           const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
@@ -3840,7 +4080,7 @@ async function enrichActiveLoanBalances() {
 
       // Post loan.history (settled = repaid) on borrower's identity for credit-score
       btn.textContent = "Posting loan.history (settled)…";
-      const VDXF_LOAN_HISTORY = "i92jad9CSjBNPCHgnHqQP4hK1facXBFDWb";
+      const VDXF_LOAN_HISTORY = "iBGuPDeeHHYpvKdM7VG2d7LR1Lct9itcpT";
       const historyPayload = {
         version: 2,
         role: "borrower",
@@ -3911,7 +4151,353 @@ if (_loansRefreshBtn) {
   };
 }
 
-// ---------- Activity feed ----------
+// ---------- History tab: daemon-first cache ----------
+//
+// History is reconstructible offline from the local daemon. We persist
+// derived rows to ~/.verus_contract_gui/history_cache.json via the GUI
+// server's /history-cache endpoint, then on each load:
+//   1. read cache → render immediately (no daemon round-trip)
+//   2. ask the daemon "anything new since lastRevisionTxid?" → walk only
+//      the new revisions, append rows, save cache, re-render
+// Once a row's source revision is buried >REORG_DEPTH blocks, it is
+// trusted unconditionally. Rows within REORG_DEPTH of tip are revalidated
+// (their source txid must still be in best chain) on every load.
+
+const HISTORY_CACHE_VERSION = 1;
+const HISTORY_REORG_DEPTH = 100;
+
+// History tab is the one place that needs to read BOTH the new (vcs::*)
+// and legacy (vrsc::*) keys, so past loans surface alongside new activity.
+// Other call sites only look at the new keys (nothing live remains on the
+// legacy side after the migration cancellation pass).
+const _HISTORY_KEY_SETS = [
+  { logical: "request", keys: VDXF_LOAN_REQUEST_KEYS },
+  { logical: "match",   keys: VDXF_LOAN_MATCH_KEYS },
+  { logical: "status",  keys: VDXF_LOAN_STATUS_KEYS },
+  { logical: "history", keys: VDXF_LOAN_HISTORY_KEYS },
+];
+
+function _readMergedEntries(cm, keys) {
+  const out = [];
+  for (const k of keys) if (cm?.[k]) out.push(...cm[k]);
+  return out;
+}
+
+function _decodeMultimapEntry(e) {
+  // getidentityhistory returns plain hex strings; getidentity returns
+  // {serializedhex|message: hex}. Handle both.
+  const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+  if (!hex) return null;
+  try { return JSON.parse(new TextDecoder().decode(_hexToBytes(hex))); }
+  catch { return null; }
+}
+
+function _entryHexKey(e) {
+  // Deterministic key for diffing. The raw serialized hex is the source
+  // of truth — two entries with identical hex are the same entry.
+  return typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+}
+
+async function loadHistoryCache() {
+  try {
+    const r = await fetch("/history-cache");
+    if (!r.ok) return { version: HISTORY_CACHE_VERSION, perIaddr: {} };
+    const j = await r.json();
+    if (!j || typeof j !== "object" || j.version !== HISTORY_CACHE_VERSION) {
+      return { version: HISTORY_CACHE_VERSION, perIaddr: {} };
+    }
+    return j;
+  } catch {
+    return { version: HISTORY_CACHE_VERSION, perIaddr: {} };
+  }
+}
+
+async function saveHistoryCache(cache) {
+  try {
+    await fetch("/history-cache", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Requested-By": "vlocal" },
+      body: JSON.stringify(cache),
+    });
+  } catch (e) {
+    console.warn("[history] cache save failed:", e?.message);
+  }
+}
+
+// Walks getidentityhistory for one iaddr and derives history rows from
+// revision-to-revision diffs. If `cachedHead` is set, only revisions
+// AFTER that revision's txid are processed (incremental update).
+//
+// Fast-path: if cachedHead is provided, first call getidentity (~200ms,
+// cheap) to peek the latest revision txid. If it equals cachedHead.txid,
+// nothing has changed since the last walk — skip getidentityhistory
+// entirely (which is much heavier, ~2s for 28 revisions). Returns {
+// unchanged: true } so the caller can skip Path A processing.
+//
+// Returns { rows, headTxid, headHeight }: rows is the new rows discovered;
+// headTxid/Height is the newest revision processed, to store as the
+// next call's cachedHead.
+async function walkHistoryFromDaemon(iaddr, cachedHead) {
+  if (cachedHead?.txid) {
+    const peek = await rpc("getidentity", [iaddr, -1]).catch(() => null);
+    if (peek?.txid && peek.txid === cachedHead.txid) {
+      // Identity hasn't been updated since last walk — Path A has no new
+      // events to discover, and Path B's latest-state was captured then.
+      return { rows: [], headTxid: cachedHead.txid, headHeight: cachedHead.height, unchanged: true };
+    }
+  }
+  const resp = await rpc("getidentityhistory", [iaddr, 0, -1]);
+  const history = resp?.history || [];
+  if (history.length === 0) return { rows: [], headTxid: null, headHeight: null };
+
+  // Find the index just past cachedHead (skip already-processed revisions).
+  let startIdx = 0;
+  if (cachedHead?.txid) {
+    const i = history.findIndex((h) => h.output?.txid === cachedHead.txid);
+    if (i >= 0) startIdx = i + 1;
+  }
+
+  const newRows = [];
+  for (let i = startIdx; i < history.length; i++) {
+    const cur  = history[i];
+    const prev = history[i - 1] || null;
+    const curCm  = cur?.identity?.contentmultimap || {};
+    const prevCm = prev?.identity?.contentmultimap || {};
+    const blockHeight = cur.height;
+    const blockHash   = cur.blockhash;
+    const txid        = cur.output?.txid;
+
+    // Per-logical-type diff. Each logical type (request/match/status/history)
+    // spans BOTH the new and legacy VDXF keys — we treat them as one bucket
+    // so that, e.g., a loan.history entry posted under either key shows up
+    // as a single "settled" event.
+    const added = {}, removed = {};
+    for (const { logical, keys } of _HISTORY_KEY_SETS) {
+      const prevArr = _readMergedEntries(prevCm, keys);
+      const curArr  = _readMergedEntries(curCm,  keys);
+      const prevSet = new Set(prevArr.map(_entryHexKey));
+      const curSet  = new Set(curArr.map(_entryHexKey));
+      added[logical]   = curArr.filter((e) => !prevSet.has(_entryHexKey(e)));
+      removed[logical] = prevArr.filter((e) => !curSet.has(_entryHexKey(e)));
+    }
+
+    // Settled events = loan.history added in this revision. The matching
+    // loan.status (added or pre-existing, either key) carries the full
+    // thread context.
+    for (const histEntry of added.history) {
+      const hp = _decodeMultimapEntry(histEntry);
+      if (!hp || !hp.loan_id) continue;
+      let statusPayload = null;
+      for (const sEntry of _readMergedEntries(curCm, VDXF_LOAN_STATUS_KEYS)) {
+        const sp = _decodeMultimapEntry(sEntry);
+        if (sp?.loan_id === hp.loan_id) { statusPayload = sp; break; }
+      }
+      // Resolve role + counterparty from whichever payload has them; the
+      // status entry usually does, but loan.history is the authoritative
+      // fallback when status was already cleared.
+      const role = statusPayload?.role || hp.role || "borrower";
+      const counterparty = statusPayload?.counterparty || hp.counterparty;
+      newRows.push({
+        __kind: "settled",
+        _myIaddr: iaddr,
+        _myRole: role,
+        loan_id: hp.loan_id,
+        state: hp.outcome === "defaulted" ? "defaulted" : "repaid",
+        principal:    statusPayload?.principal     || hp.principal,
+        collateral:   statusPayload?.collateral    || hp.collateral,
+        repay:        statusPayload?.repay         || hp.repay,
+        term_days:    statusPayload?.term_days     ?? hp.term_days,
+        borrower_iaddr: role === "lender" ? counterparty : iaddr,
+        lender_iaddr:   role === "lender" ? iaddr : counterparty,
+        posted_block:        statusPayload?.posted_block,
+        settled_at_block:    hp.repaid_at_block ?? hp.defaulted_at_block ?? statusPayload?.repaid_at_block ?? blockHeight,
+        tx_repay_txid:       hp.tx_repay_txid    || statusPayload?.tx_repay_txid,
+        history_source_txid: txid,
+        history_source_block: blockHeight,
+        history_source_blockhash: blockHash,
+      });
+    }
+
+    // Cancellation events: removed loan.request or loan.match entry.
+    // Disambiguation for loan.request: if a loan.status with matching
+    // loan_id was added in the SAME revision, this is an "accept" (atomic
+    // request → status transition), NOT a cancellation.
+    const addedStatusLoanIds = new Set(
+      added.status.map(_decodeMultimapEntry).filter(Boolean).map((s) => s.loan_id)
+    );
+    for (const reqEntry of removed.request) {
+      const rp = _decodeMultimapEntry(reqEntry);
+      if (!rp) continue;
+      const loanId = rp.request_txid || rp.loan_id;
+      if (loanId && addedStatusLoanIds.has(loanId)) continue; // accept, not cancel
+      newRows.push({
+        __kind: "cancelled",
+        _myIaddr: iaddr,
+        _vdxfType: "loan.request",
+        cancel_txid:  txid,
+        cancel_block: blockHeight,
+        cancel_blockhash: blockHash,
+        payload: rp,
+      });
+    }
+    for (const matchEntry of removed.match) {
+      const mp = _decodeMultimapEntry(matchEntry);
+      if (!mp) continue;
+      newRows.push({
+        __kind: "cancelled",
+        _myIaddr: iaddr,
+        _vdxfType: "loan.match",
+        cancel_txid:  txid,
+        cancel_block: blockHeight,
+        cancel_blockhash: blockHash,
+        payload: mp,
+      });
+    }
+  }
+
+  // Path B: scan the LATEST multimap for terminal-state loan.status
+  // entries we haven't already emitted as settled rows. The lender protocol
+  // doesn't always post loan.history; instead it flips `settled: true` on
+  // the existing loan.status entry. Diff-based detection (Path A above) would
+  // see this as add+remove of an entry — better to just trust the final
+  // state for "is this loan settled from this iaddr's perspective?"
+  //
+  // Dedupe by loan_id so we don't double-emit when both paths fire.
+  const seenSettledLoanIds = new Set(newRows.filter((r) => r.__kind === "settled").map((r) => r.loan_id));
+  const latest = history[history.length - 1];
+  const latestCm = latest?.identity?.contentmultimap || {};
+  for (const sEntry of _readMergedEntries(latestCm, VDXF_LOAN_STATUS_KEYS)) {
+    const sp = _decodeMultimapEntry(sEntry);
+    if (!sp || !sp.loan_id) continue;
+    if (sp.settled !== true && sp.active !== false) continue;       // still in flight
+    if (seenSettledLoanIds.has(sp.loan_id)) continue;               // already emitted via Path A
+    let hp = null;
+    for (const hEntry of _readMergedEntries(latestCm, VDXF_LOAN_HISTORY_KEYS)) {
+      const j = _decodeMultimapEntry(hEntry);
+      if (j?.loan_id === sp.loan_id) { hp = j; break; }
+    }
+    newRows.push({
+      __kind: "settled",
+      _myIaddr: iaddr,
+      _myRole: sp.role || (hp?.role) || "borrower",
+      loan_id: sp.loan_id,
+      state: (hp?.outcome === "defaulted" || sp.defaulted === true) ? "defaulted" : "repaid",
+      principal:    sp.principal,
+      collateral:   sp.collateral,
+      repay:        sp.repay,
+      term_days:    sp.term_days,
+      borrower_iaddr: sp.role === "lender" ? sp.counterparty : iaddr,
+      lender_iaddr:   sp.role === "lender" ? iaddr : sp.counterparty,
+      posted_block:        sp.originated_block ?? sp.posted_block,
+      settled_at_block:    hp?.repaid_at_block ?? hp?.defaulted_at_block ?? sp.repaid_at_block ?? null,
+      tx_repay_txid:       hp?.tx_repay_txid    || sp.settled_tx,
+      // No source_txid for Path B (no specific revision triggered it) — use
+      // the latest revision as the witness, and let reorg pruning skip it.
+      history_source_txid:  latest.output?.txid,
+      history_source_block: latest.height,
+      history_source_blockhash: latest.blockhash,
+    });
+  }
+
+  const head = history[history.length - 1];
+  return {
+    rows: newRows,
+    headTxid:   head.output?.txid,
+    headHeight: head.height,
+  };
+}
+
+// Reorg sentinel: drop any cached row whose source block is within
+// REORG_DEPTH of tip and whose source txid is no longer in best chain.
+// Older rows are trusted.
+async function pruneCacheForReorgs(perIaddrEntry, tipHeight) {
+  if (!perIaddrEntry?.rows?.length) return perIaddrEntry;
+  const safeBoundary = tipHeight - HISTORY_REORG_DEPTH;
+  const recent = perIaddrEntry.rows.filter((r) => {
+    const b = r.__kind === "cancelled" ? r.cancel_block : r.history_source_block;
+    return b != null && b > safeBoundary;
+  });
+  if (recent.length === 0) return perIaddrEntry;
+  const checks = await Promise.all(recent.map((r) => {
+    const tx = r.__kind === "cancelled" ? r.cancel_txid : r.history_source_txid;
+    if (!tx) return Promise.resolve({ row: r, ok: true });
+    return rpc("getrawtransaction", [tx, 1])
+      .then((info) => ({ row: r, ok: (info?.confirmations ?? 0) > 0 }))
+      .catch(() => ({ row: r, ok: false }));
+  }));
+  const orphaned = new Set(checks.filter((c) => !c.ok).map((c) => c.row));
+  if (orphaned.size === 0) return perIaddrEntry;
+  console.warn(`[history] reorg detected — dropping ${orphaned.size} orphan row(s) for re-walk`);
+  const minOrphanBlock = Math.min(...[...orphaned].map((r) =>
+    (r.__kind === "cancelled" ? r.cancel_block : r.history_source_block) || tipHeight
+  ));
+  // Drop everything from the orphaned block onwards + reset head so the
+  // walker re-processes that range.
+  return {
+    ...perIaddrEntry,
+    rows: perIaddrEntry.rows.filter((r) => {
+      const b = r.__kind === "cancelled" ? r.cancel_block : r.history_source_block;
+      return b != null && b < minOrphanBlock;
+    }),
+    headTxid: null,    // force walker to start from genesis-of-history
+    headHeight: null,  // (cheap; getidentityhistory returns full list anyway)
+  };
+}
+
+// For each lender match in the rows we collected, look up the borrower's
+// loan.history to discover settlement outcomes that landed on the
+// borrower's identity (not ours). Caches results; once finalized, never
+// re-fetched.
+async function resolveLenderOutcomes(cache, iaddr) {
+  const entry = cache.perIaddr[iaddr];
+  if (!entry) return entry;
+  entry.borrowerOutcomes ||= {};
+
+  // Distinct borrower iaddrs referenced by our active matches (current
+  // multimap, not removed). For removed matches, we don't need outcome —
+  // they're already cancelled rows.
+  const myInfo = await rpc("getidentity", [iaddr, -1]).catch(() => null);
+  const myCm = myInfo?.identity?.contentmultimap || {};
+  // Read both vcs:: and vrsc:: keys: a lender match posted under the
+  // legacy key still needs its outcome resolved during the transition.
+  const myMatches = _readMergedEntries(myCm, VDXF_LOAN_MATCH_KEYS).map(_decodeMultimapEntry).filter(Boolean);
+
+  for (const m of myMatches) {
+    const borrowerIa = m.request?.iaddr;
+    const loanId     = m.tx_a_txid;
+    if (!borrowerIa || !loanId) continue;
+    const cacheKey = `${borrowerIa}:${loanId}`;
+    if (entry.borrowerOutcomes[cacheKey]) continue; // already finalized
+
+    const bInfo = await rpc("getidentity", [borrowerIa, -1]).catch(() => null);
+    const bcm = bInfo?.identity?.contentmultimap || {};
+    let bHistory = null, bStatus = null;
+    for (const e of _readMergedEntries(bcm, VDXF_LOAN_HISTORY_KEYS)) {
+      const j = _decodeMultimapEntry(e);
+      if (j?.loan_id === loanId) { bHistory = j; break; }
+    }
+    for (const e of _readMergedEntries(bcm, VDXF_LOAN_STATUS_KEYS)) {
+      const j = _decodeMultimapEntry(e);
+      if (j?.loan_id === loanId) { bStatus = j; break; }
+    }
+    if (!bHistory) continue; // not yet settled
+
+    entry.borrowerOutcomes[cacheKey] = {
+      loan_id: loanId,
+      state: bHistory.outcome === "defaulted" ? "defaulted" : "repaid",
+      principal:        bStatus?.principal  || bHistory.principal  || m.principal,
+      collateral:       bStatus?.collateral || bHistory.collateral || m.collateral,
+      repay:            bStatus?.repay      || bHistory.repay      || m.repay,
+      term_days:        bStatus?.term_days  ?? m.term_days,
+      borrower_iaddr:   borrowerIa,
+      lender_iaddr:     iaddr,
+      posted_block:     bStatus?.posted_block || m.request?.block,
+      settled_at_block: bHistory.repaid_at_block ?? bHistory.defaulted_at_block,
+      tx_repay_txid:    bHistory.tx_repay_txid,
+    };
+  }
+  return entry;
+}
 
 async function loadActivity(targetEl) {
   const el = targetEl || document.getElementById("market-list") || document.getElementById("activity-list");
@@ -3922,38 +4508,132 @@ async function loadActivity(targetEl) {
     el.innerHTML = `<div class="empty">No local identities to query.</div>`;
     return;
   }
-
-  // History = terminal-state loans only (repaid or defaulted). One row
-  // per loan, joined via /loans/by-party. Open requests, in-flight
-  // status updates, etc. live in other tabs.
   const acting = actingIaddr();
   const partyAddrs = (acting && acting !== "all") ? [acting] : myIaddrs;
-  const results = (await Promise.all(
-    partyAddrs.map((ia) =>
-      fetchLoansByParty(ia)
-        .then((j) => (j.results || [])
-          .filter((row) => row.state === 'repaid' || row.state === 'defaulted')
-          .map((row) => ({ ...row, _myIaddr: ia, _myRole: ia === row.borrower_iaddr ? 'borrower' : 'lender' }))
-        )
-        .catch(() => [])
-    )
-  )).flat();
 
-  // De-dupe by loan_id (when both sides are local, same loan shows up twice)
-  const byId = new Map();
-  for (const r of results) byId.set(r.loan_id || r.request_txid, r);
-  const flat = Array.from(byId.values())
-    .sort((a, b) => (b.posted_block ?? 0) - (a.posted_block ?? 0));
+  // Step 1: read cache, render immediately.
+  const cache = await loadHistoryCache();
+  cache.perIaddr ||= {};
+  const renderFromCache = () => {
+    const flat = [];
+    for (const ia of partyAddrs) {
+      const entry = cache.perIaddr[ia];
+      if (!entry?.rows) continue;
+      for (const r of entry.rows) flat.push(r);
+      // Lender outcomes (from borrower's identity) are stored as a separate
+      // map; project them as settled rows under the lender's view.
+      for (const out of Object.values(entry.borrowerOutcomes || {})) {
+        flat.push({
+          __kind: "settled",
+          _myIaddr: ia,
+          _myRole: "lender",
+          ...out,
+        });
+      }
+    }
+    flat.sort((a, b) => {
+      const aB = a.__kind === "cancelled" ? a.cancel_block : (a.settled_at_block ?? a.posted_block);
+      const bB = b.__kind === "cancelled" ? b.cancel_block : (b.settled_at_block ?? b.posted_block);
+      return (bB ?? 0) - (aB ?? 0);
+    });
+    const _ctHistory = document.getElementById("ct-history");
+    if (_ctHistory) _ctHistory.textContent = String(flat.length);
+    if (flat.length === 0) {
+      el.innerHTML = `<div class="empty">No completed loans yet. <span class="muted" style="font-size:11px">(checking daemon…)</span></div>`;
+    } else {
+      el.innerHTML = flat.map((row) =>
+        row.__kind === "cancelled" ? renderCancelledRow(row) : renderHistoryRow(row)
+      ).join("");
+      enrichHistoryRows();
+    }
+  };
+  renderFromCache();
 
-  const _ctHistory = document.getElementById("ct-history");
-  if (_ctHistory) _ctHistory.textContent = String(flat.length);
+  // Step 2: incremental walk per iaddr in parallel. For each iaddr we walk
+  // only revisions newer than the cached head, append rows, refresh lender
+  // outcomes. Parallel because each iaddr's walk is independent.
+  const tipHeight = await rpc("getblockcount", []).catch(() => 0);
+  const mutations = await Promise.all(partyAddrs.map(async (ia) => {
+    cache.perIaddr[ia] ||= { headTxid: null, headHeight: null, rows: [], borrowerOutcomes: {} };
+    let dirty = false;
+    const pruned = await pruneCacheForReorgs(cache.perIaddr[ia], tipHeight);
+    if (pruned !== cache.perIaddr[ia]) {
+      cache.perIaddr[ia] = pruned;
+      dirty = true;
+    }
+    try {
+      const cachedHead = cache.perIaddr[ia].headTxid
+        ? { txid: cache.perIaddr[ia].headTxid, height: cache.perIaddr[ia].headHeight }
+        : null;
+      const result = await walkHistoryFromDaemon(ia, cachedHead);
+      if (result.rows.length > 0) {
+        // Dedupe: settled rows by loan_id, cancelled rows by cancel_txid.
+        // Path B (latest-state scan) re-emits known settled rows on every
+        // walk; we filter them here so the cache stays clean.
+        const existing = cache.perIaddr[ia].rows;
+        const seenSettled  = new Set(existing.filter((r) => r.__kind === "settled").map((r) => r.loan_id));
+        const seenCanceled = new Set(existing.filter((r) => r.__kind === "cancelled").map((r) => r.cancel_txid));
+        const fresh = result.rows.filter((r) =>
+          r.__kind === "settled"   ? !seenSettled.has(r.loan_id)
+          : r.__kind === "cancelled" ? !seenCanceled.has(r.cancel_txid)
+          : true
+        );
+        if (fresh.length > 0) {
+          cache.perIaddr[ia].rows.push(...fresh);
+          dirty = true;
+        }
+      }
+      if (result.headTxid) {
+        cache.perIaddr[ia].headTxid   = result.headTxid;
+        cache.perIaddr[ia].headHeight = result.headHeight;
+        dirty = true;
+      }
+      const before = JSON.stringify(cache.perIaddr[ia].borrowerOutcomes || {});
+      await resolveLenderOutcomes(cache, ia);
+      if (JSON.stringify(cache.perIaddr[ia].borrowerOutcomes || {}) !== before) dirty = true;
+    } catch (e) {
+      console.warn(`[history] daemon walk failed for ${ia}: ${e?.message}`);
+    }
+    return dirty;
+  }));
+  const mutated = mutations.some(Boolean);
+  cache.tipHeight = tipHeight;
 
-  if (flat.length === 0) {
-    el.innerHTML = `<div class="empty">No completed loans yet.</div>`;
-    return;
+  if (mutated) {
+    await saveHistoryCache(cache);
+    renderFromCache();
   }
-  el.innerHTML = flat.map(renderHistoryRow).join("");
-  enrichHistoryRows();
+}
+
+// One row per cancellation event (request or match withdrawn before the
+// loan opened). Shows what was cancelled, by whom, when.
+function renderCancelledRow(row) {
+  const p = row.payload || {};
+  const isRequest = row._vdxfType === "loan.request";
+  const verb = isRequest ? "Request cancelled" : "Match cancelled";
+  const who = isRequest ? "Borrower withdrew their request" : "Lender withdrew their match";
+  // Match payloads have request.iaddr (the borrower); request payloads have
+  // their own posting iaddr (== row._myIaddr).
+  const otherParty = isRequest ? p.target_lender_iaddr : p.request?.iaddr;
+  const ts = row.cancel_ts ? new Date(row.cancel_ts).toISOString().slice(0, 16).replace("T", " ") : "";
+  return `
+    <div class="card" data-cancel-tx="${escapeHtml(row.cancel_txid || '')}">
+      <div class="row" style="margin-bottom:6px">
+        <strong style="flex:1">${escapeHtml(verb)}</strong>
+        <span class="badge" style="background:rgba(120,120,120,0.2);color:#888">cancelled</span>
+      </div>
+      <div class="muted" style="font-size:13px;margin-bottom:6px">${escapeHtml(who)}</div>
+      <div class="kv" style="font-size:12px">
+        ${p.principal ? `<div><span class="k">principal</span><span class="v">${formatAmount(p.principal)}</span></div>` : ""}
+        ${p.collateral ? `<div><span class="k">collateral</span><span class="v">${formatAmount(p.collateral)}</span></div>` : ""}
+        ${p.repay ? `<div><span class="k">repay</span><span class="v">${formatAmount(p.repay)}</span></div>` : ""}
+        ${p.term_days != null ? `<div><span class="k">term</span><span class="v">${escapeHtml(p.term_days)}d</span></div>` : ""}
+        ${otherParty ? `<div><span class="k">${isRequest ? "target lender" : "borrower"}</span><span class="v"><a href="/address/${escapeHtml(otherParty)}" class="font-mono">${escapeHtml(otherParty.slice(0, 16))}…</a></span></div>` : ""}
+        <div><span class="k">cancelled</span><span class="v">block ${row.cancel_block ?? "?"} <span class="cancelled-ts ${ts ? '' : 'muted'}">${escapeHtml(ts)}${ts ? ' UTC' : ''}</span></span></div>
+        <div><span class="k">cancel tx</span><span class="v"><a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(row.cancel_txid || "")}" target="_blank"><code>${escapeHtml((row.cancel_txid || "").slice(0, 20))}…</code></a></span></div>
+      </div>
+    </div>
+  `;
 }
 
 function renderActivityRow(ev) {
@@ -4001,48 +4681,70 @@ function renderHistoryRow(row) {
 const _txTimeCache = new Map();
 const _identityNameCache = new Map();
 async function enrichHistoryRows() {
-  const cards = document.querySelectorAll('#market-list .mp-row[data-loan-id]');
-  for (const card of cards) {
+  const lookup = (txid) => {
+    if (!txid) return Promise.resolve(null);
+    if (_txTimeCache.has(txid)) return _txTimeCache.get(txid);
+    const p = rpc('getrawtransaction', [txid, 1]).catch(() => null);
+    _txTimeCache.set(txid, p);
+    return p;
+  };
+  const lookupName = (ia) => {
+    if (!ia) return Promise.resolve(null);
+    let p = _identityNameCache.get(ia);
+    if (!p) {
+      p = rpc('getidentity', [ia]).then((info) => info?.identity?.fullyqualifiedname || info?.identity?.name).catch(() => null);
+      _identityNameCache.set(ia, p);
+    }
+    return p;
+  };
+  const fmtBlock = (tx) => {
+    if (!tx) return '(not confirmed yet)';
+    const t = tx.time ? new Date(tx.time * 1000).toISOString().slice(0, 16).replace('T', ' ') : '';
+    return `block ${tx.height ?? '?'}${t ? ` · ${t} UTC` : ''}`;
+  };
+  const fmtTime = (tx) => {
+    if (!tx?.time) return '';
+    return new Date(tx.time * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+  };
+
+  // All enrichment runs in parallel — each card is independent. Sequential
+  // awaits would block the whole UI on slow daemon responses.
+  const tasks = [];
+
+  for (const card of document.querySelectorAll('#market-list .mp-row[data-loan-id]')) {
     const loanId = card.dataset.loanId;
     const txRepay = card.dataset.txRepay;
-
-    const fmtBlock = (tx) => {
-      if (!tx) return '(not confirmed yet)';
-      const t = tx.time ? new Date(tx.time * 1000).toISOString().slice(0, 16).replace('T', ' ') : '';
-      return `block ${tx.height ?? '?'}${t ? ` · ${t} UTC` : ''}`;
-    };
-    const lookup = async (txid) => {
-      if (!txid) return null;
-      if (_txTimeCache.has(txid)) return _txTimeCache.get(txid);
-      const p = rpc('getrawtransaction', [txid, 1]).catch(() => null);
-      _txTimeCache.set(txid, p);
-      return p;
-    };
-
     if (loanId) {
-      const tx = await lookup(loanId);
-      const cell = card.querySelector('.originated-ts');
-      if (cell) { cell.classList.remove('muted'); cell.textContent = fmtBlock(tx); }
+      tasks.push(lookup(loanId).then((tx) => {
+        const cell = card.querySelector('.originated-ts');
+        if (cell) { cell.classList.remove('muted'); cell.textContent = fmtBlock(tx); }
+      }));
     }
     if (txRepay) {
-      const tx = await lookup(txRepay);
-      const cell = card.querySelector('.settled-ts');
-      if (cell) { cell.classList.remove('muted'); cell.textContent = fmtBlock(tx); }
+      tasks.push(lookup(txRepay).then((tx) => {
+        const cell = card.querySelector('.settled-ts');
+        if (cell) { cell.classList.remove('muted'); cell.textContent = fmtBlock(tx); }
+      }));
     }
-
-    // Resolve borrower/lender iaddrs to fully-qualified names.
     for (const span of card.querySelectorAll('.party-name')) {
-      const ia = span.dataset.iaddr;
-      if (!ia) continue;
-      let p = _identityNameCache.get(ia);
-      if (!p) {
-        p = rpc('getidentity', [ia]).then((info) => info?.identity?.fullyqualifiedname || info?.identity?.name).catch(() => null);
-        _identityNameCache.set(ia, p);
-      }
-      const name = await p;
-      if (name) span.textContent = name;
+      tasks.push(lookupName(span.dataset.iaddr).then((name) => {
+        if (name) span.textContent = name;
+      }));
     }
   }
+
+  for (const card of document.querySelectorAll('#market-list .card[data-cancel-tx]')) {
+    const cancelTx = card.dataset.cancelTx;
+    if (!cancelTx) continue;
+    const cell = card.querySelector('.cancelled-ts');
+    if (!cell || cell.textContent.trim()) continue;
+    tasks.push(lookup(cancelTx).then((tx) => {
+      const t = fmtTime(tx);
+      if (t) { cell.classList.remove('muted'); cell.textContent = t; }
+    }));
+  }
+
+  await Promise.all(tasks);
 }
 
 const _activityRefreshBtn = document.getElementById("activity-refresh");
@@ -4075,9 +4777,9 @@ async function autoAcceptWatcher() {
   try {
     const myIaddrs = await inScopeIaddrs();
     if (myIaddrs.length === 0) return;
-    const VDXF_LOAN_REQUEST = "iPmnErqWbf5NhhWZEoccuX8yU8CgFt2d28";
-    const VDXF_LOAN_MATCH   = "iBvgGuNNVxEQYCeDD4uPykgrGbWnyTQhGT";
-    const VDXF_LOAN_STATUS  = "iP5b6uX8SM7ZSiiMbVWwGj9wG76KuJWZys";
+    const VDXF_LOAN_REQUEST = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
+    const VDXF_LOAN_MATCH   = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+    const VDXF_LOAN_STATUS  = "iPnrakyY951QEy6xUYBuJoobHA9JKY6G8j";
 
     for (const ia of myIaddrs) {
       const info = await rpc("getidentity", [ia, -1]).catch(() => null);

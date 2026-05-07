@@ -27,6 +27,13 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parent
 STATIC_DIR = APP_DIR / "static"
 
+# Persistent cache for History tab — settled/cancelled loan events derived
+# from local daemon walks. The GUI reads this on tab open (instant render),
+# then asks the daemon "anything new since lastRevisionTxid?" and patches
+# the cache. Makes History reconstructible offline once primed.
+CACHE_DIR = Path.home() / ".verus_contract_gui"
+HISTORY_CACHE_PATH = CACHE_DIR / "history_cache.json"
+
 
 def read_rpc_config(conf_path: Path) -> dict:
     if not conf_path.exists():
@@ -66,11 +73,15 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("", "/"):
             return self._serve_static("/index.html")
+        if self.path == "/history-cache":
+            return self._handle_history_cache_get()
         return self._serve_static(self.path)
 
     def do_POST(self):
         if self.path == "/rpc":
             return self._handle_rpc()
+        if self.path == "/history-cache":
+            return self._handle_history_cache_post()
         self._send_json(404, {"error": "not found"})
 
     # CSRF defense: require a custom header on /rpc. Cross-origin requests
@@ -89,10 +100,11 @@ class Handler(BaseHTTPRequestHandler):
         "createrawtransaction", "signrawtransaction", "sendrawtransaction",
         "getaddressbalance", "getaddressutxos", "getaddressmempool",
         "getaddresstxids",
-        "listidentities", "getidentity", "getcurrency",
+        "listidentities", "getidentity", "getidentityhistory", "getcurrency",
         "addmultisigaddress", "createmultisig", "validateaddress",
         "sendcurrency", "z_getoperationresult", "z_getoperationstatus",
         "updateidentity", "signmessage",
+        "lockunspent", "listlockunspent",
     }
 
     def _security_headers(self):
@@ -186,6 +198,36 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
         except Exception as e:
             self._send_json(502, {"error": f"rpc unreachable: {e}"})
+
+    def _handle_history_cache_get(self):
+        # Returns {} if no cache exists yet — GUI treats that as cold start.
+        try:
+            if HISTORY_CACHE_PATH.exists():
+                data = json.loads(HISTORY_CACHE_PATH.read_text())
+            else:
+                data = {}
+            self._send_json(200, data)
+        except Exception as e:
+            self._send_json(500, {"error": f"cache read failed: {e}"})
+
+    def _handle_history_cache_post(self):
+        # Same CSRF guard as /rpc — only same-origin GUI may write.
+        if self.headers.get(self.CSRF_HEADER) != self.CSRF_VALUE:
+            return self._send_json(403, {"error": "missing csrf header"})
+        body = self._read_body()
+        try:
+            parsed = json.loads(body)
+            if not isinstance(parsed, dict):
+                return self._send_json(400, {"error": "expected object"})
+            # Atomic write: temp file in same dir then rename. Avoids
+            # corrupted cache if process is killed mid-write.
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = HISTORY_CACHE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(parsed, separators=(",", ":")))
+            tmp.replace(HISTORY_CACHE_PATH)
+            self._send_json(200, {"ok": True, "bytes": HISTORY_CACHE_PATH.stat().st_size})
+        except Exception as e:
+            self._send_json(500, {"error": f"cache write failed: {e}"})
 
 
 def main():
