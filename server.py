@@ -19,6 +19,7 @@ import base64
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -173,6 +174,17 @@ class Handler(BaseHTTPRequestHandler):
         method = parsed.get("method") if isinstance(parsed, dict) else None
         if method not in self.ALLOWED_RPC:
             return self._send_json(403, {"error": f"rpc method not allowed: {method!r}"})
+
+        # DIAG: log updateidentity payloads + outcomes to /tmp/rpc_diag.log
+        # so we can see exactly what's being sent when the daemon rejects.
+        if method == "updateidentity":
+            try:
+                with open("/tmp/rpc_diag.log", "a") as f:
+                    f.write(f"\n=== updateidentity request @ {time.time()} ===\n")
+                    f.write(json.dumps(parsed.get("params", []), indent=2)[:6000])
+                    f.write("\n")
+            except Exception:
+                pass
 
         cfg = self.rpc_cfg
         url = f"http://{cfg['rpchost']}:{cfg['rpcport']}/"

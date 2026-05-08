@@ -22,9 +22,14 @@ export async function rpc(method, params = []) {
   try {
     json = JSON.parse(text);
   } catch {
-    throw new Error(`non-JSON response: ${text.slice(0, 200)}`);
+    // Non-JSON response (often the daemon dying or HTTP-level error). Surface
+    // the method + status so the call site / browser console pinpoints the
+    // failing call instead of just "500 Internal Server Error".
+    console.error(`[rpc] ${method} → ${res.status} ${res.statusText}: non-JSON response: ${text.slice(0, 300)}`);
+    throw new Error(`${method} (${res.status}): non-JSON response: ${text.slice(0, 200)}`);
   }
   if (json.error) {
+    console.error(`[rpc] ${method} → error:`, json.error);
     throw new Error(`${method}: ${json.error.message || JSON.stringify(json.error)}`);
   }
   return json.result;
