@@ -1042,9 +1042,12 @@ async function fetchLoansByParty(address, state) {
   if (slot && slot.data && (now - slot.at) < MARKET_CACHE_TTL_MS) return slot.data;
   if (slot && slot.inflight) return slot.inflight;
   const inflight = (async () => {
+    // 8s timeout (see fetchOneMarketTab — same hang-prevention rationale).
+    const ctl = new AbortController();
+    const tid = setTimeout(() => ctl.abort(), 8000);
     try {
       const stateQ = state ? `&state=${encodeURIComponent(state)}` : '';
-      const r = await fetch(`${EXPLORER_API}/contracts/loans/by-party?address=${encodeURIComponent(address)}${stateQ}&pageSize=200&include_mempool=true`);
+      const r = await fetch(`${EXPLORER_API}/contracts/loans/by-party?address=${encodeURIComponent(address)}${stateQ}&pageSize=200&include_mempool=true`, { signal: ctl.signal });
       if (r.status === 429) {
         // Surface stale data if any; otherwise empty fallback
         return slot?.data || { results: [] };
@@ -1054,6 +1057,8 @@ async function fetchLoansByParty(address, state) {
       return json;
     } catch {
       return slot?.data || { results: [] };
+    } finally {
+      clearTimeout(tid);
     }
   })();
   if (!slot) _byPartyCache.set(key, { at: 0, data: null, inflight });
@@ -1071,8 +1076,16 @@ async function fetchOneMarketTab(path) {
   if (!slot) { slot = { at: 0, data: null, inflight: null }; _marketEndpointCache.set(path, slot); }
   slot.inflight = (async () => {
     for (let attempt = 0; attempt < 2; attempt++) {
+      // 8s timeout per attempt. Without it, a single hung explorer call
+      // would poison the inflight slot indefinitely (all future callers
+      // await the same promise) AND would block fetchMarketBundle's
+      // Promise.all, preventing the mempool-merge fallback from running
+      // at all. Aggressive timeout keeps the loans tab responsive even
+      // when scan.verus.cx is unreachable.
+      const ctl = new AbortController();
+      const tid = setTimeout(() => ctl.abort(), 8000);
       try {
-        const r = await fetch(`${EXPLORER_API}${path}`);
+        const r = await fetch(`${EXPLORER_API}${path}`, { signal: ctl.signal });
         if (r.status === 429) {
           if (attempt === 0) {
             await new Promise((res) => setTimeout(res, 700 + Math.random() * 400));
@@ -1092,6 +1105,8 @@ async function fetchOneMarketTab(path) {
           continue;
         }
         return slot.data || { __failed: true, results: [] };
+      } finally {
+        clearTimeout(tid);
       }
     }
     return slot.data || { __failed: true, results: [] };
@@ -1256,6 +1271,122 @@ async function fetchMarketBundle() {
   }
   return [reqRes, offRes, mchRes];
 }
+
+// Daemon-only bundle for the Loans tab. NO scan.verus.cx calls. Walks own
+// multimap (for myReqs / myOffs / myMchs) plus every iaddr in the
+// counterparty watch list (for matchesAtMe / reqsAtMe). Watch list is
+// seeded from past identity history — i.e. anyone we've ever interacted
+// with via loan.request, loan.match, or loan.status.
+//
+// Rationale: the explorer's typed /loans endpoints are confirmed-only
+// (4–5 min block lag) and add a ~1.5s blocking RPC even when the daemon
+// already has the data mempool-fresh. For the Loans tab — own posts and
+// directed counterparty traffic — we can be 100% local once both parties
+// know each other's iaddrs. Stranger discovery (the marketplace browse
+// tabs) still uses fetchMarketBundle.
+//
+// Returns the same shape as fetchMarketBundle: [reqRes, offRes, mchRes].
+async function fetchLoansBundleDaemon(myIaddrs) {
+  const reqResults = [];
+  const mchResults = [];
+  const mySet = new Set(myIaddrs);
+
+  // Offers are the one explorer-backed leg we keep — they're public
+  // discovery (not directed counterparty traffic), so the 60s block + 15s
+  // explorer cache is fine. Fetch in parallel with the daemon walks so it
+  // doesn't add latency, and so the Marketplace badge count (ct-market)
+  // stays accurate when the user is on the Loans tab. Own-offer entries
+  // from acting iaddrs' own multimaps are merged in below for mempool
+  // freshness on "your own posts."
+  const offResultsPromise = fetchOneMarketTab("/contracts/loans/offers?pageSize=200")
+    .then((r) => r?.results || [])
+    .catch(() => []);
+  const ownOffResults = [];
+
+  const decode = (e) => {
+    const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+    if (!hex) return null;
+    try { return JSON.parse(new TextDecoder().decode(_hexToBytes(hex))); }
+    catch { return null; }
+  };
+  const VDXF_REQ = "iFg76F9M8CV5xEg3L2NvCDBXufaxjUWhaW";
+  const VDXF_MCH = "i4G69W7e3UJRCinuP7TFBRnm3ZUiXzPkFt";
+  const VDXF_OFF = "iA1vgVBV5B29h5pxQ67gxqCoEaLDZ8WbmY";
+
+  // 1. Walk each acting iaddr's own multimap. Captures my own posts.
+  //    Also collects counterparty iaddrs to watch (target_lender_iaddr
+  //    on my requests, request.iaddr on my matches).
+  const counterparties = new Set();
+  await Promise.all(myIaddrs.map(async (ia) => {
+    let info;
+    try { info = await rpc("getidentity", [ia, -1]); } catch { return; }
+    const cm = info?.identity?.contentmultimap || {};
+    const fqn = info?.identity?.fullyqualifiedname || info?.identity?.name;
+    const tipTxid = info?.txid;
+    const name = info?.identity?.name;
+    for (const e of (cm[VDXF_REQ] || [])) {
+      const j = decode(e); if (!j) continue;
+      reqResults.push({ ...j, iaddr: ia, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+      if (j.target_lender_iaddr && !mySet.has(j.target_lender_iaddr)) counterparties.add(j.target_lender_iaddr);
+    }
+    for (const e of (cm[VDXF_OFF] || [])) {
+      const j = decode(e); if (!j) continue;
+      ownOffResults.push({ ...j, iaddr: ia, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+    }
+    for (const e of (cm[VDXF_MCH] || [])) {
+      const j = decode(e); if (!j) continue;
+      mchResults.push({ ...j, match_iaddr: ia, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+      if (j.request?.iaddr && !mySet.has(j.request.iaddr)) counterparties.add(j.request.iaddr);
+    }
+    // Also seed counterparties from past identity history (one-time RPC,
+    // module-cached). This catches anyone we've previously transacted
+    // with even if they have no current entry on our identity.
+    const seeds = await getCounterpartyWatchList(ia).catch(() => []);
+    for (const cp of seeds) if (!mySet.has(cp)) counterparties.add(cp);
+  }));
+
+  // 2. Walk each counterparty's multimap for entries directed at one of
+  //    my iaddrs. mempool-aware (-1) so newly-posted entries surface
+  //    before block confirmation.
+  await Promise.all(Array.from(counterparties).map(async (cpIa) => {
+    let info;
+    try { info = await rpc("getidentity", [cpIa, -1]); } catch { return; }
+    const cm = info?.identity?.contentmultimap || {};
+    const fqn = info?.identity?.fullyqualifiedname || info?.identity?.name;
+    const tipTxid = info?.txid;
+    const name = info?.identity?.name;
+    for (const e of (cm[VDXF_REQ] || [])) {
+      const j = decode(e); if (!j) continue;
+      // Only include requests directed at one of my iaddrs.
+      if (j.target_lender_iaddr && mySet.has(j.target_lender_iaddr)) {
+        reqResults.push({ ...j, iaddr: cpIa, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+      }
+    }
+    for (const e of (cm[VDXF_MCH] || [])) {
+      const j = decode(e); if (!j) continue;
+      // Only include matches whose request comes from one of my iaddrs.
+      if (j.request?.iaddr && mySet.has(j.request.iaddr)) {
+        mchResults.push({ ...j, match_iaddr: cpIa, fullyQualifiedName: fqn, name, posted_tx: tipTxid });
+      }
+    }
+  }));
+
+  // Merge explorer offers + own-multimap offers (own-multimap wins on
+  // dedup so my mempool-fresh own posts beat any stale explorer copy).
+  const explorerOffers = await offResultsPromise;
+  const ownIaddrs = new Set(ownOffResults.map((o) => o.iaddr));
+  const offResults = [
+    ...ownOffResults,
+    ...explorerOffers.filter((o) => !ownIaddrs.has(o.iaddr)),
+  ];
+
+  return [
+    { results: reqResults },
+    { results: offResults },
+    { results: mchResults },
+  ];
+}
+
 function invalidateMarketCache() {
   for (const slot of _marketEndpointCache.values()) {
     slot.at = 0;
@@ -1275,7 +1406,15 @@ async function loadMarket() {
   if (!el.querySelector(".mp-row")) el.textContent = "Loading…";
   const acting = actingIaddr();
 
-  const bundle = await fetchMarketBundle();
+  // The Loans tab is own + known-counterparty traffic only — fully
+  // serviceable from the local daemon (mempool-aware) once both parties
+  // know each other's iaddrs. Skipping the explorer here cuts ~1.5s off
+  // every refresh and removes a confirmed-only-staleness footgun. Other
+  // tabs (Marketplace browse) still use fetchMarketBundle, since the
+  // explorer is the only way to discover strangers' open posts.
+  const bundle = mpTab === "loans"
+    ? await fetchLoansBundleDaemon(await inScopeIaddrs())
+    : await fetchMarketBundle();
   if (myToken !== _marketLoadToken) return;
   const [reqRes, offRes, mchRes] = bundle;
   // If the active tab's data fetch failed (rate-limited) and we already have
@@ -1490,8 +1629,47 @@ async function loadMarket() {
       !acceptedRequestTxids.has(r.request?.txid) && !acceptedTxAtxids.has(r.tx_a_txid)
     );
     // My posted matches (I'm lender, waiting for borrower to accept).
-    let myMchs = (mchRes.results || []).filter((r) =>
-      mySet.has(r.match_iaddr) && !acceptedTxAtxids.has(r.tx_a_txid)
+    // Source these directly from MY OWN identity multimap (daemon, not
+    // explorer). The explorer's typed view strips v2-only fields and
+    // is confirmed-only — for our own data we have authoritative state
+    // on our daemon. Merge with explorer's view for redundancy, dedup
+    // by request.txid.
+    let myMchs = [];
+    try {
+      const seen = new Set();
+      for (const ia of partyAddrs) {
+        const info = await rpc("getidentity", [ia, -1]);
+        const cm = info?.identity?.contentmultimap || {};
+        const fqn = info?.identity?.fullyqualifiedname || info?.identity?.name;
+        for (const e of (cm[VDXF_LOAN_MATCH] || [])) {
+          const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
+          if (!hex) continue;
+          try {
+            const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
+            const k = j.request?.txid || j.tx_a_txid || JSON.stringify(j.request || {});
+            if (seen.has(k)) continue;
+            seen.add(k);
+            myMchs.push({ ...j, match_iaddr: ia, fullyQualifiedName: fqn });
+          } catch {}
+        }
+      }
+      // Augment with explorer entries we don't have locally (rare — covers
+      // the case where the daemon hasn't seen the most recent identity tx).
+      for (const r of (mchRes.results || [])) {
+        if (!mySet.has(r.match_iaddr)) continue;
+        const k = r.request?.txid || r.tx_a_txid;
+        if (!k || seen.has(k)) continue;
+        seen.add(k);
+        myMchs.push(r);
+      }
+    } catch (e) {
+      console.warn("[loadMarket] daemon-walk for own matches failed:", e?.message);
+      myMchs = (mchRes.results || []).filter((r) => mySet.has(r.match_iaddr));
+    }
+    // Dedup against any signal that this match has been accepted/settled.
+    myMchs = myMchs.filter((r) =>
+      !acceptedTxAtxids.has(r.tx_a_txid) &&
+      !acceptedRequestTxids.has(r.request?.txid)
     );
 
     // Active loans — daemon-first walk per acting/local iaddr.
@@ -2627,7 +2805,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
             ? `<div style="margin-top:10px;font-size:12px;color:var(--muted)">Will split a fresh ${escapeHtml(principalCcy)} UTXO via sendcurrency, then post the match.</div>`
             : `<div style="margin-top:10px;color:var(--bad);font-size:12px">No ${escapeHtml(principalCcy)} balance at ${escapeHtml(lenderR)} large enough to fund ${formatAmount(r.principal)}.</div>`}
           ${candidates.length ? `<div class="row" style="margin-top:10px;gap:8px">
-              <button class="primary" data-mp-row-act="post-match-go" style="flex:0 0 auto">Confirm — build, sign &amp; broadcast</button>
+              <button class="primary" data-mp-row-act="post-match-go" style="flex:0 0 auto" disabled title="Loading…">Confirm — build, sign &amp; broadcast</button>
               <button class="ghost" data-mp-row-act="post-match-decline" style="flex:0 0 auto" title="Tell the borrower you're passing on this — writes a small loan.decline entry on your identity (≈0.0001 VRSC fee).">Decline</button>
               <button class="ghost" data-mp-row-act="post-match-cancel" style="flex:0 0 auto" title="Just close this panel (no on-chain signal — you can come back later).">Dismiss</button>
             </div>` : ""}
@@ -2660,6 +2838,13 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
         panel.dataset.actingFqn = lenderInfo?.identity?.fullyqualifiedname || acting;
         panel.dataset.actingParent = lenderInfo?.identity?.parent || "";
         panel.dataset.actingName = lenderInfo?.identity?.name || "";
+        // Dataset is fully populated — enable the Confirm button. Until now
+        // it was disabled because clicking with an empty dataset would fire
+        // the handler with `acting=undefined` and surface as "request directed
+        // at <X>, you are acting as undefined". This race is the root cause
+        // of that error; gating the button on dataset readiness eliminates it.
+        const goBtn = panel.querySelector('[data-mp-row-act="post-match-go"]');
+        if (goBtn) { goBtn.disabled = false; goBtn.removeAttribute('title'); }
       } catch (e) {
         const vp = panel.querySelector(".vault-preview");
         if (vp) vp.textContent = `(could not derive vault: ${e.message})`;
@@ -4856,18 +5041,20 @@ async function enrichActiveLoanBalances() {
       // still return the full history. Keeps the per-key blob under Verus's
       // script-element cap (TESTING.md §37) regardless of trade volume.
       newCm[VDXF_LOAN_HISTORY] = [historyHex];
-      // Flip the loan.status entry to inactive so it stops showing up.
-      const updatedStatus = { ...status, active: false, repaid_tx: repayBroadcastTxid };
-      newCm[VDXF_LOAN_STATUS] = (newCm[VDXF_LOAN_STATUS] || []).map((hex) => {
+      // Drop the matching loan.status entry — loan.history is the canonical
+      // terminal record; a "soft-deleted" loan.status with active:false
+      // would be a tombstone that pretends to be live state. Indexer's
+      // state-derivation prefers history over status (contracts.ts:582).
+      // Any other still-active loan.status entries (concurrent loans on
+      // the same borrower) are preserved.
+      const remainingStatus = (newCm[VDXF_LOAN_STATUS] || []).filter((hex) => {
         try {
           const j = JSON.parse(new TextDecoder().decode(_hexToBytes(hex)));
-          if (j.loan_id === loanId) {
-            return Array.from(new TextEncoder().encode(JSON.stringify(updatedStatus)))
-              .map((b) => b.toString(16).padStart(2, "0")).join("");
-          }
-        } catch {}
-        return hex;
+          return j.loan_id !== loanId;
+        } catch { return true; }
       });
+      if (remainingStatus.length) newCm[VDXF_LOAN_STATUS] = remainingStatus;
+      else delete newCm[VDXF_LOAN_STATUS];
       // Retry the updateidentity if it transiently fails. Tx-Repay is
       // already broadcast — failure here just leaves the on-chain
       // bookkeeping (loan.history) un-posted; it doesn't affect funds.
@@ -5020,8 +5207,7 @@ async function walkHistoryFromDaemon(iaddr, cachedHead) {
   if (cachedHead?.txid) {
     const peek = await rpc("getidentity", [iaddr, -1]).catch(() => null);
     if (peek?.txid && peek.txid === cachedHead.txid) {
-      // Identity hasn't been updated since last walk — Path A has no new
-      // events to discover, and Path B's latest-state was captured then.
+      // Identity hasn't been updated since last walk — no new events.
       return { rows: [], headTxid: cachedHead.txid, headHeight: cachedHead.height, unchanged: true };
     }
   }
@@ -5134,49 +5320,13 @@ async function walkHistoryFromDaemon(iaddr, cachedHead) {
     }
   }
 
-  // Path B: scan the LATEST multimap for terminal-state loan.status
-  // entries we haven't already emitted as settled rows. The lender protocol
-  // doesn't always post loan.history; instead it flips `settled: true` on
-  // the existing loan.status entry. Diff-based detection (Path A above) would
-  // see this as add+remove of an entry — better to just trust the final
-  // state for "is this loan settled from this iaddr's perspective?"
-  //
-  // Dedupe by loan_id so we don't double-emit when both paths fire.
-  const seenSettledLoanIds = new Set(newRows.filter((r) => r.__kind === "settled").map((r) => r.loan_id));
-  const latest = history[history.length - 1];
-  const latestCm = latest?.identity?.contentmultimap || {};
-  for (const sEntry of _readMergedEntries(latestCm, VDXF_LOAN_STATUS_KEYS)) {
-    const sp = _decodeMultimapEntry(sEntry);
-    if (!sp || !sp.loan_id) continue;
-    if (sp.settled !== true && sp.active !== false) continue;       // still in flight
-    if (seenSettledLoanIds.has(sp.loan_id)) continue;               // already emitted via Path A
-    let hp = null;
-    for (const hEntry of _readMergedEntries(latestCm, VDXF_LOAN_HISTORY_KEYS)) {
-      const j = _decodeMultimapEntry(hEntry);
-      if (j?.loan_id === sp.loan_id) { hp = j; break; }
-    }
-    newRows.push({
-      __kind: "settled",
-      _myIaddr: iaddr,
-      _myRole: sp.role || (hp?.role) || "borrower",
-      loan_id: sp.loan_id,
-      state: (hp?.outcome === "defaulted" || sp.defaulted === true) ? "defaulted" : "repaid",
-      principal:    sp.principal,
-      collateral:   sp.collateral,
-      repay:        sp.repay,
-      term_days:    sp.term_days,
-      borrower_iaddr: sp.role === "lender" ? sp.counterparty : iaddr,
-      lender_iaddr:   sp.role === "lender" ? iaddr : sp.counterparty,
-      posted_block:        sp.originated_block ?? sp.posted_block,
-      settled_at_block:    hp?.repaid_at_block ?? hp?.defaulted_at_block ?? sp.repaid_at_block ?? null,
-      tx_repay_txid:       hp?.tx_repay_txid    || sp.settled_tx,
-      // No source_txid for Path B (no specific revision triggered it) — use
-      // the latest revision as the witness, and let reorg pruning skip it.
-      history_source_txid:  latest.output?.txid,
-      history_source_block: latest.height,
-      history_source_blockhash: latest.blockhash,
-    });
-  }
+  // (Removed: vestigial Path B that scanned latest multimap for loan.status
+  // with `active: false || settled: true`. Path B existed for a legacy
+  // lender protocol that flipped `settled: true` on loan.status instead of
+  // posting loan.history. The current GUI never writes that flag — settles
+  // always go through loan.history (Path A). Plus, Phases 1+2 dropped the
+  // soft-delete entirely, so loan.status with `active: false` won't appear
+  // in current state on a settled loan anyway. Path A is sufficient.)
 
   const head = history[history.length - 1];
   return {
@@ -5373,8 +5523,7 @@ async function loadActivity(targetEl) {
       const result = await walkHistoryFromDaemon(ia, cachedHead);
       if (result.rows.length > 0) {
         // Dedupe: settled rows by loan_id, cancelled rows by cancel_txid.
-        // Path B (latest-state scan) re-emits known settled rows on every
-        // walk; we filter them here so the cache stays clean.
+        // Walks may re-emit known events; filter so the cache stays clean.
         const existing = cache.perIaddr[ia].rows;
         const seenSettled  = new Set(existing.filter((r) => r.__kind === "settled").map((r) => r.loan_id));
         const seenCanceled = new Set(existing.filter((r) => r.__kind === "cancelled").map((r) => r.cancel_txid));
@@ -5464,7 +5613,7 @@ function renderCancelledRow(row) {
         ${p.collateral ? `<div><span class="k">collateral</span><span class="v">${formatAmount(p.collateral)}</span></div>` : ""}
         ${p.repay ? `<div><span class="k">repay</span><span class="v">${formatAmount(p.repay)}</span></div>` : ""}
         ${p.term_days != null ? `<div><span class="k">term</span><span class="v">${escapeHtml(p.term_days)}d</span></div>` : ""}
-        ${counterparty ? `<div><span class="k">${counterpartyLabel}</span><span class="v"><a href="/address/${escapeHtml(counterparty)}" class="font-mono">${escapeHtml(counterparty.slice(0, 16))}…</a></span></div>` : ""}
+        ${counterparty ? `<div><span class="k">${counterpartyLabel}</span><span class="v"><a href="https://scan.verus.cx/address/${escapeHtml(counterparty)}" target="_blank" class="font-mono">${escapeHtml(counterparty.slice(0, 16))}…</a></span></div>` : ""}
         <div><span class="k">cancelled</span><span class="v">block ${row.cancel_block ?? "?"} <span class="cancelled-ts ${ts ? '' : 'muted'}">${escapeHtml(ts)}${ts ? ' UTC' : ''}</span></span></div>
         <div><span class="k">cancel tx</span><span class="v"><a href="https://scan.verus.cx/vrsc/tx/${escapeHtml(row.cancel_txid || "")}" target="_blank"><code>${escapeHtml((row.cancel_txid || "").slice(0, 20))}…</code></a></span></div>
       </div>
@@ -5789,6 +5938,12 @@ async function persistAttestation(iaddr, loanId) {
 }
 
 // Build + post a loan.history entry on `iaddr`'s identity (always-1 overwrite).
+// Also drops the matching live loan.match entry (by tx_a_txid === payload.loan_id)
+// so the lender's identity doesn't accumulate stale `active:true` matches for
+// loans that have already settled. The principle is uniform across contract
+// types: live entries describe open positions; once a position closes, drop
+// it. The history entry is the audit trail. Concurrent matches (different
+// loans) are preserved.
 // Returns the txid of the updateidentity, or throws.
 async function postHistoryEntry(iaddr, payload) {
   const idInfo = await rpc("getidentity", [iaddr, -1]);
@@ -5804,6 +5959,18 @@ async function postHistoryEntry(iaddr, payload) {
   const hex = Array.from(new TextEncoder().encode(JSON.stringify(payload)))
     .map((b) => b.toString(16).padStart(2, "0")).join("");
   newCm[VDXF_LOAN_HISTORY] = [hex];   // always-1 overwrite
+  // Drop the loan.match entry for this loan_id (if present). Safe to no-op
+  // when we're not the lender (borrower has no loan.match entries).
+  if (payload?.loan_id && (newCm[VDXF_LOAN_MATCH] || []).length > 0) {
+    const remaining = newCm[VDXF_LOAN_MATCH].filter((mhex) => {
+      try {
+        const m = JSON.parse(new TextDecoder().decode(_hexToBytes(mhex)));
+        return m?.tx_a_txid !== payload.loan_id;
+      } catch { return true; }
+    });
+    if (remaining.length) newCm[VDXF_LOAN_MATCH] = remaining;
+    else delete newCm[VDXF_LOAN_MATCH];
+  }
   return await rpc("updateidentity", [{
     name: ident.name,
     parent: ident.parent || "",

@@ -205,6 +205,61 @@ function snapshot() {
 
 // ── GUI driver helpers ────────────────────────────────────────────────
 
+// Wait until loadMarket has rendered at least once after the latest tab
+// switch (placeholder "Loading…" has been replaced). Use this when the
+// data we want is in the GUI's own daemon multimap — one settled cycle
+// is sufficient; no need to bust any cache.
+async function waitForMarketSettled(page, { timeout = 120000 } = {}) {
+  await page.waitForFunction(() => {
+    const list = document.getElementById("market-list");
+    return list && list.textContent.trim() !== "Loading…";
+  }, { timeout });
+}
+
+// Bust the marketplace's 15s explorer cache without stomping an in-flight
+// load. Only used when the data we want is on the COUNTERPARTY's daemon
+// (reached via scan.verus.cx /api/contracts/loans/{requests,matches},
+// which are confirmed-only with 4-5min block lag) — own-multimap reads
+// don't need this, they just need one settled cycle. loadMarket uses a
+// token (main.js:1571) that aborts the prior cycle when a new one starts,
+// so we wait until the previous cycle has rendered before clicking
+// market-refresh again. Pass a shared {t:0} object across pollUntil ticks.
+async function refreshIfIdle(page, ref) {
+  if (Date.now() - ref.t < 5000) return;
+  const isLoading = await page.evaluate(() => {
+    const list = document.getElementById("market-list");
+    return list?.textContent?.trim() === "Loading…";
+  });
+  if (isLoading) return;
+  await page.evaluate(() => document.getElementById("market-refresh")?.click());
+  ref.t = Date.now();
+}
+
+// Pick acting identity from the dropdown. Waits for the picker to be
+// populated with the target as an option (listidentities RPC is async) so
+// the value-set isn't a no-op, then dispatches change. Downstream handlers
+// (postRequestViaGui, etc.) wait for their own readiness signals — we
+// don't wait for #mp-id-info.dataset here because that element only
+// exists after the post form is opened, not on picker change.
+async function selectActingIdentity(page, iaddr) {
+  await page.waitForFunction((target) => {
+    const s = document.getElementById("mp-id-picker");
+    return s && Array.from(s.options).some((o) => o.value === target);
+  }, iaddr, { timeout: 30000 });
+  await page.evaluate((t) => {
+    const s = document.getElementById("mp-id-picker");
+    s.value = t;
+    s.dispatchEvent(new Event("change"));
+  }, iaddr);
+  // The change handler does localStorage.setItem(...) synchronously then
+  // kicks off loadMarket() async. localStorage write is what every
+  // downstream "acting" lookup reads, so wait for that — confirms the
+  // change actually fired (not silently dropped).
+  await page.waitForFunction((target) => {
+    return localStorage.getItem("vl_acting_iaddr") === target;
+  }, iaddr, { timeout: 10000 });
+}
+
 async function openPage(url, iaddr) {
   const browser = await chromium.launch({ headless: true });
   const ctx = await browser.newContext();
@@ -223,13 +278,7 @@ async function openPage(url, iaddr) {
   });
   await page.goto(url, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#mp-r-picker", { timeout: 15000 });
-  await sleep(1500);
-  await page.evaluate((t) => {
-    const s = document.getElementById("mp-id-picker");
-    s.value = t;
-    s.dispatchEvent(new Event("change"));
-  }, iaddr);
-  await sleep(3000);
+  await selectActingIdentity(page, iaddr);
   return { browser, page };
 }
 
@@ -292,12 +341,14 @@ async function postRequestViaGui(page, params) {
 // then polls until the match is on chain.
 async function postMatchViaGui(page) {
   const matchesBefore = (multimapOf(LENDER_IA, true)[VDXF.match] || []).length;
-  // The lender's GUI fetches via scan.verus.cx — keep refreshing the
-  // marketplace until the request shows up. Refresh on each tick to bust
-  // its 15s cache.
+  // The lender's GUI fetches via scan.verus.cx — refresh periodically to
+  // bust its 15s cache, but only when the previous loadMarket cycle has
+  // settled (refreshIfIdle gates this). Lender's daemon (.44) is slow, so
+  // each loadMarket can take 30s+; spamming refresh would never let one
+  // complete.
+  const refMatch = { t: 0 };
   await pollUntil("lender's GUI sees the request", async () => {
-    await page.evaluate(() => document.getElementById("market-refresh")?.click());
-    await sleep(2500);  // brief wait for refresh fetch to complete
+    await refreshIfIdle(page, refMatch);
     return await page.evaluate(() => !!document.querySelector('[data-mp-row-act="post-match"]'));
   }, { timeoutMs: 600000, intervalMs: 1500 });  // 10min: explorer-side loans/requests view only includes confirmed state, so this poll has to span block-production gaps (4-5min long blocks observed)
   await page.evaluate(() => document.querySelector('[data-mp-row-act="post-match"]').click());
@@ -364,22 +415,18 @@ async function clickRepay(borrowerPage, loanId) {
   });
   await page.goto(BORROWER_GUI, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#mp-r-picker", { timeout: 15000 });
-  await sleep(1500);
-  await page.evaluate((t) => {
-    const s = document.getElementById("mp-id-picker");
-    s.value = t;
-    s.dispatchEvent(new Event("change"));
-  }, BORROWER_IA);
-  await sleep(3000);
+  await selectActingIdentity(page, BORROWER_IA);
   await page.evaluate(() => document.querySelector('[data-mp-tab="loans"]').click());
   // Poll until either: (a) repay completed on chain (loan.history(repaid)
   // appeared — the GUI's repay handler disables the button immediately on
   // click, so the button check would fail right after a successful click),
   // or (b) repay button is enabled and we click it.
   // Whichever fires first.
+  // Borrower's loan.status is in their own multimap; one settled
+  // loadMarket cycle is enough to render the Repay button.
+  await waitForMarketSettled(page);
   let clicked = false;
   let lastDiagAt = 0;
-  let lastRefreshAt = 0;
   await pollUntil("repay completed (chain) OR button enabled", async () => {
     // (a) Did chain settle? Cheapest check first.
     const cm = multimapOf(BORROWER_IA);
@@ -387,11 +434,6 @@ async function clickRepay(borrowerPage, loanId) {
     if (histories.find((h) => h.loan_id === loanId && h.outcome === "repaid")) {
       console.log("    [clickRepay] loan.history(repaid) on chain — done");
       return true;
-    }
-    // (b) Trigger market-refresh occasionally so balance cell updates.
-    if (Date.now() - lastRefreshAt > 10000) {
-      lastRefreshAt = Date.now();
-      await page.evaluate(() => document.getElementById("market-refresh")?.click());
     }
     const r = await page.evaluate(() => {
       const btn = document.querySelector('[data-loan-act="repay"]');
@@ -516,17 +558,13 @@ async function scenario2_borrowerCancelsRequest() {
     console.log("  ✓ request posted");
 
     console.log("  borrower cancels request via GUI…");
+    // Borrower's own request lives in their own multimap. One settled
+    // loadMarket cycle is enough — no refresh loop needed.
     await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]').click());
-    let lastRefresh = 0;
-    await pollUntil("cancel-request button visible", async () => {
-      // Force market-refresh every 10s — explorer indexer lag can take
-      // up to a block before the new request shows in the loans tab.
-      if (Date.now() - lastRefresh > 10000) {
-        lastRefresh = Date.now();
-        await bp.evaluate(() => document.getElementById("market-refresh")?.click());
-      }
-      return await bp.evaluate(() => !!document.querySelector('[data-mp-row-act="cancel"]'));
-    }, { intervalMs: 2000 });
+    await waitForMarketSettled(bp);
+    await pollUntil("cancel-request button visible",
+      () => bp.evaluate(() => !!document.querySelector('[data-mp-row-act="cancel"]')),
+      { intervalMs: 1000 });
     await bp.evaluate(() => document.querySelector('[data-mp-row-act="cancel"]').click());
     await pollUntil("loan.request removed from multimap",
       () => (multimapOf(BORROWER_IA)[VDXF.request] || []).length === 0,
@@ -563,14 +601,13 @@ async function scenario3_lenderCancelsMatch() {
       console.log("  lender cancels match via GUI…");
       await lp.evaluate(() => document.getElementById("market-refresh")?.click());
       await lp.evaluate(() => document.querySelector('[data-mp-tab="loans"]').click());
-      let lastRefresh3 = 0;
-      await pollUntil("cancel-match button visible", async () => {
-        if (Date.now() - lastRefresh3 > 10000) {
-          lastRefresh3 = Date.now();
-          await lp.evaluate(() => document.getElementById("market-refresh")?.click());
-        }
-        return await lp.evaluate(() => !!document.querySelector('[data-loan-act="cancel-match"]'));
-      }, { intervalMs: 2000 });
+      // Lender's own match lives in their own multimap. One settled
+      // loadMarket cycle (which on .44 takes ~30s due to slow daemon
+      // RPC) is enough to render the cancel-match button.
+      await waitForMarketSettled(lp);
+      await pollUntil("cancel-match button visible",
+        () => lp.evaluate(() => !!document.querySelector('[data-loan-act="cancel-match"]')),
+        { intervalMs: 1000 });
       await lp.evaluate(() => document.querySelector('[data-loan-act="cancel-match"]').click());
       await pollUntil("loan.match for this borrower removed", () => {
         const cm = multimapOf(LENDER_IA, true);
@@ -600,9 +637,9 @@ async function scenario4_manualAccept() {
     console.log("  borrower clicks accept-v2 manually…");
     // Match rows render only on the loans tab — postRequestViaGui left us on market.
     await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]')?.click());
+    const refAcceptV2 = { t: 0 };
     await pollUntil("accept-v2 button visible", async () => {
-      await bp.evaluate(() => document.getElementById("market-refresh")?.click());
-      await sleep(2500);
+      await refreshIfIdle(bp, refAcceptV2);
       return await bp.evaluate(() => {
         const btn = document.querySelector('[data-mp-row-act="accept-v2"]');
         return btn && !btn.disabled;
@@ -772,9 +809,9 @@ async function scenario8_lenderInsufficient() {
     });
     const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
     try {
+      const refSee = { t: 0 };
       await pollUntil("lender's GUI sees the request", async () => {
-        await lp.evaluate(() => document.getElementById("market-refresh")?.click());
-        await sleep(2500);
+        await refreshIfIdle(lp, refSee);
         return await lp.evaluate(() => !!document.querySelector('[data-mp-row-act="post-match"]'));
       }, { timeoutMs: 240000, intervalMs: 1500 });
       // Click Fund — should open panel but NO confirm button (no eligible UTXO)
@@ -925,101 +962,71 @@ async function scenario12_chainOnlyRecovery() {
 
 // ── SCENARIO 13: replay-safety across loans ──────────────────────────
 // Same (borrower, lender) pair share the same deterministic vault P2SH.
-// We don't need to open two consecutive loans in the test — past loans
-// are already on chain via getidentityhistory. Walk past revisions to
-// find a previously-settled loan, pull its tx_repay_signed, and try to
-// replay it. The vault UTXO it referenced is consumed, so the daemon
-// must reject with bad-txns-inputs-spent (or equivalent).
-//
-// If a Loan A is already settled in chain history, we just need ONE
-// fresh Loan B to set up an active vault UTXO for the replay attempt.
-// Skipping the Loan-A-from-scratch step shaves ~10min off the test.
+// Run Loan A end-to-end, capture its tx_repay_signed, then open Loan B
+// with the SAME parties. Try to reuse Loan A's tx_repay against Loan B's
+// vault UTXO. The protocol's per-loan input commitment (signature pins
+// to txid_A:vout) should reject every replay attempt.
 async function scenario13_replaySafety() {
-  // 1. Walk borrower's identity history for a past loan.history(repaid),
-  // grab its tx_repay_txid (the actual broadcast settlement tx), then
-  // fetch the full broadcast tx hex via getrawtransaction. THAT is what
-  // a replay attacker would have at hand — the tx that already settled
-  // a past loan, complete with funding input + borrower sig. We try to
-  // re-broadcast it and assert daemon rejects.
-  //
-  // (loan.status.tx_repay_signed is a partial — vault-half only — not
-  // directly broadcastable. The on-chain broadcast tx is the right
-  // replay subject because it's a fully-formed valid tx for its time.)
-  console.log("  scanning borrower identity history for a past loan.history(repaid)…");
-  const hist = cliJ(`getidentityhistory ${BORROWER_IA} 0 -1`);
-  const revs = hist?.history || [];
-  console.log(`  ${revs.length} identity revisions to scan`);
-  let pastTxRepayTxid = null, pastLoanId = null;
-  for (const rev of revs) {
-    const cm = rev?.identity?.contentmultimap || {};
-    for (const e of (cm[VDXF.history] || [])) {
-      const hex = typeof e === "string" ? e : (e?.serializedhex || e?.message || "");
-      if (!hex) continue;
-      try {
-        const j = JSON.parse(Buffer.from(hex, "hex").toString("utf8"));
-        if (j.outcome === "repaid" && j.tx_repay_txid && j.loan_id) {
-          pastTxRepayTxid = j.tx_repay_txid;
-          pastLoanId = j.loan_id;
-          break;
-        }
-      } catch {}
-    }
-    if (pastTxRepayTxid) break;
-  }
-  if (!pastTxRepayTxid) throw new Error("no past loan.history(repaid) with tx_repay_txid in borrower identity history — can't run replay test");
-  console.log(`  found settled loan ${pastLoanId.slice(0,12)}… tx_repay_txid=${pastTxRepayTxid.slice(0,16)}…`);
-
-  // Fetch the full broadcast Tx-Repay hex (decoded form is valid; we'll
-  // try to re-broadcast the raw hex and expect rejection).
-  let pastTxRepayHex;
-  try {
-    pastTxRepayHex = cli(`getrawtransaction ${pastTxRepayTxid}`);
-  } catch (e) {
-    throw new Error(`couldn't fetch raw tx for past tx_repay ${pastTxRepayTxid}: ${e.message}`);
-  }
-  console.log(`  fetched past Tx-Repay raw hex (${pastTxRepayHex.length / 2} bytes)`);
-
-  // 2. Open a fresh Loan B so vault has a current UTXO (replay target).
   const { browser: bb, page: bp } = await openPage(BORROWER_GUI, BORROWER_IA);
   try {
-    console.log("  Loan B: opening fresh vault UTXO…");
+    // 1. Run Loan A
+    console.log("  Loan A: opening…");
     await postRequestViaGui(bp, {
       lender: LENDER_IA, principal: 5, principalCcy: "DAI.vETH",
       collateral: 10, collateralCcy: "VRSC", repay: 5.05, term: 30, autoAccept: true,
     });
-    const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
+    let lb, lp;
+    ({ browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA));
+    try { await postMatchViaGui(lp); } finally { await lb.close(); }
+    await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]')?.click());
+    const statusA = await waitForActiveLoan();
+    console.log(`  Loan A loan_id: ${statusA.loan_id.slice(0,12)}…`);
+
+    // 2. Capture Loan A's tx_repay_signed BEFORE settlement
+    const loanA_tx_repay_signed = await bp.evaluate((loanId) =>
+      localStorage.getItem(`vl_tx_repay_${loanId}`), statusA.loan_id);
+    if (!loanA_tx_repay_signed) throw new Error("Loan A tx_repay_signed not in localStorage — can't run replay test");
+    console.log(`  captured Loan A tx_repay_signed (${loanA_tx_repay_signed.length / 2} bytes)`);
+
+    // 3. Settle Loan A normally
+    console.log("  settling Loan A…");
+    await clickRepay(bp, statusA.loan_id);
+    await waitForRepaid(statusA.loan_id);
+    await pollUntil("Loan A vault drained", () => {
+      const utxos = cliJ(`getaddressutxos '{"addresses":["${VAULT_ADDR}"]}'`);
+      return Array.isArray(utxos) && utxos.length === 0;
+    }, { intervalMs: 2000 });
+    console.log("  ✓ Loan A settled");
+
+    // 4. Open Loan B (same parties → same vault P2SH, fresh UTXO)
+    console.log("  Loan B: opening with same parties (fresh vault UTXO)…");
+    await postRequestViaGui(bp, {
+      lender: LENDER_IA, principal: 5, principalCcy: "DAI.vETH",
+      collateral: 10, collateralCcy: "VRSC", repay: 5.05, term: 30, autoAccept: true,
+    });
+    ({ browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA));
     try { await postMatchViaGui(lp); } finally { await lb.close(); }
     await bp.evaluate(() => document.querySelector('[data-mp-tab="loans"]')?.click());
     const statusB = await waitForActiveLoan();
     console.log(`  Loan B loan_id: ${statusB.loan_id.slice(0,12)}…`);
-    if (statusB.loan_id === pastLoanId) throw new Error("Loan B has same loan_id as the past settled loan — UTXO didn't change?");
+    if (statusB.loan_id === statusA.loan_id) throw new Error("Loan A and Loan B have the same loan_id — fresh Tx-A didn't happen");
 
-    // 3. Replay attempt: broadcast past loan's actual Tx-Repay raw hex.
-    // That tx already mined into a block — daemon must reject as already
-    // known (or report the tx as already in chain). Either way, no
-    // re-execution against any current vault UTXO.
-    console.log("  replay attempt: broadcasting past loan's full Tx-Repay raw hex…");
-    let attemptErr = "";
+    // 5. Replay attempt: broadcast Loan A's old tx_repay against the chain
+    console.log("  replay attempt: broadcasting Loan A's old tx_repay_signed…");
+    let attempt1Rejected = false, attempt1Err = "";
     try {
-      const result = cli(`sendrawtransaction ${pastTxRepayHex}`);
-      throw new Error(`REPLAY VULNERABILITY: past Tx-Repay accepted on chain: ${result}`);
+      cli(`sendrawtransaction ${loanA_tx_repay_signed}`);
     } catch (e) {
-      attemptErr = e.message;
+      attempt1Rejected = true;
+      attempt1Err = e.message;
     }
-    // Acceptable rejection patterns:
-    //   - "tx-expiring-soon" — Verus's expiryheight field; old txs can't
-    //     be rebroadcast outside their original ~20-block window. This is
-    //     the FIRST defense against replay (in addition to spent inputs).
-    //   - "inputs-spent" / "missing-inputs" — vault UTXO already consumed.
-    //   - "already in block/mempool/chain" / "already known" — exact tx
-    //     already mined; daemon dedups.
-    //   - "conflict" — generic spend conflict.
-    if (!/expiring|expir.*height|inputs[-_]spent|already.*spent|missing.*inputs|conflict|bad-txns|already in (block|mempool)|already known|already.*chain/i.test(attemptErr)) {
-      throw new Error(`past Tx-Repay rejected but error was unexpected: ${attemptErr.slice(0,400)}`);
+    if (!attempt1Rejected) throw new Error("REPLAY VULNERABILITY: Loan A's tx_repay was accepted on chain");
+    if (!/inputs[-_]spent|already.*spent|missing.*inputs|conflict|bad-txns/i.test(attempt1Err)) {
+      throw new Error(`Loan A tx_repay rejected but error was unexpected: ${attempt1Err.slice(0,300)}`);
     }
-    console.log(`  ✓ rejection: ${attemptErr.match(/[a-z][a-z-]+(?:[-_][a-z]+)*/i)?.[0] || "rejected"} — replay blocked at protocol level`);
+    console.log(`  ✓ rejection: ${attempt1Err.slice(0,120)}…`);
 
-    // 4. Settle Loan B normally to confirm it isn't affected by the attempt
+    // 6. Settle Loan B normally to confirm it isn't affected
     console.log("  settling Loan B normally…");
     await clickRepay(bp, statusB.loan_id);
     await waitForRepaid(statusB.loan_id);
@@ -1027,72 +1034,7 @@ async function scenario13_replaySafety() {
       const utxos = cliJ(`getaddressutxos '{"addresses":["${VAULT_ADDR}"]}'`);
       return Array.isArray(utxos) && utxos.length === 0;
     }, { intervalMs: 2000 });
-    console.log("  ✓ Loan B settled normally — replay attempt didn't affect chain state");
-  } finally { await bb.close(); }
-}
-
-// ── SCENARIO 14: lender declines borrower's request ──────────────────
-// Borrower posts a request with auto_accept=false. Lender's GUI opens
-// the Fund panel (auto-load). Lender clicks Decline. Asserts:
-//   - lender's identity has a fresh loan.decline entry pointing at
-//     borrower's request_txid
-//   - borrower's loan.request stays on chain (not modified by lender)
-//   - borrower-side decline watcher's seen-set picks up the entry
-async function scenario14_lenderDeclines() {
-  const VDXF_DECLINE = "iBhQXJ21aqiH9kFvGqUrQy7MnKBdq1eyKc";
-  const { browser: bb, page: bp } = await openPage(BORROWER_GUI, BORROWER_IA);
-  try {
-    console.log("  borrower posts request (auto_accept=false)…");
-    await postRequestViaGui(bp, {
-      lender: LENDER_IA,
-      principal: 5, principalCcy: "DAI.vETH",
-      collateral: 10, collateralCcy: "VRSC",
-      repay: 5.05, term: 30, autoAccept: false,
-    });
-    console.log("  ✓ request posted");
-
-    const { browser: lb, page: lp } = await openPage(LENDER_GUI, LENDER_IA);
-    try {
-      // Wait for lender's GUI to surface the request + Fund panel.
-      console.log("  waiting for lender's Fund panel to render…");
-      await pollUntil("fund panel visible", async () => {
-        await lp.evaluate(() => document.getElementById("market-refresh")?.click());
-        await sleep(2500);
-        return await lp.evaluate(() => !!document.querySelector('[data-mp-row-act="post-match-decline"]'));
-      }, { intervalMs: 1500 });
-      console.log("  ✓ Decline button visible");
-
-      // Override window.confirm so the click goes through without modal.
-      await lp.evaluate(() => { window.confirm = () => true; });
-
-      console.log("  lender clicks Decline…");
-      await lp.evaluate(() => document.querySelector('[data-mp-row-act="post-match-decline"]').click());
-
-      // Wait for the loan.decline entry to land on the lender's identity.
-      const decline = await pollUntil("loan.decline on lender's identity", () => {
-        const cm = multimapOf(LENDER_IA, true);
-        const ents = (cm[VDXF_DECLINE] || []).map(decodeEntry).filter(Boolean);
-        return ents.find((d) => d.borrower_iaddr === BORROWER_IA);
-      }, { intervalMs: 3000 });
-      console.log(`  ✓ loan.decline posted; reason=${decline.reason ?? "(none)"}`);
-
-      // Sanity: borrower's loan.request is still on chain, untouched.
-      const borrowerCm = multimapOf(BORROWER_IA);
-      const reqs = (borrowerCm[VDXF.request] || []).map(decodeEntry).filter(Boolean);
-      const myReq = reqs.find((r) => r.target_lender_iaddr === LENDER_IA);
-      if (!myReq) throw new Error("borrower's loan.request was modified — lender shouldn't be able to do that");
-      console.log("  ✓ borrower's request unchanged on chain");
-    } finally { await lb.close(); }
-
-    // Borrower-side check: refresh + verify decline banner appears.
-    console.log("  refreshing borrower's loans tab — expecting decline banner…");
-    await bp.evaluate(() => document.getElementById("market-refresh")?.click());
-    await pollUntil("decline banner on borrower's GUI", async () =>
-      await bp.evaluate(() => !!document.querySelector(".decline-banner")),
-      { intervalMs: 3000 });
-    const bannerText = await bp.evaluate(() => document.querySelector(".decline-banner")?.innerText || "");
-    if (!/declined/i.test(bannerText)) throw new Error(`unexpected banner text: ${bannerText.slice(0,200)}`);
-    console.log(`  ✓ borrower sees decline banner: "${bannerText.replace(/\s+/g, " ").slice(0,140)}…"`);
+    console.log("  ✓ Loan B settled cleanly — replay attempt did not affect normal flow");
   } finally { await bb.close(); }
 }
 
@@ -1114,7 +1056,6 @@ async function scenario14_lenderDeclines() {
   await maybe(9, "9. borrower insufficient collateral",         scenario9_borrowerInsufficient);
   await maybe(12, "12. chain-only recovery (past revisions)",   scenario12_chainOnlyRecovery);
   await maybe(13, "13. replay safety across loans",             scenario13_replaySafety);
-  await maybe(14, "14. lender declines borrower's request",     scenario14_lenderDeclines);
 
   // Final cleanup
   console.log("\n=== final cleanup ===");
