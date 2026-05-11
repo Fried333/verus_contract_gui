@@ -2746,6 +2746,7 @@ document.getElementById("market-list").addEventListener("click", async (ev) => {
       repay_amount: repay,
       term_days: offerTerm,
       min_collateral_ratio: offerRatio,  // form validation gates Preview on collateral/principal ≥ this
+      accepted_collateral: offerCols,    // restricts the collateral_currency dropdown to what the lender accepts
     });
     return;
   }
@@ -3933,6 +3934,30 @@ async function openMarketPostForm(kind, prefill) {
     setVal('[data-f="term_days"]',           prefill.term_days);
     if (prefill.min_collateral_ratio != null) {
       formEl.dataset.minCollateralRatio = String(prefill.min_collateral_ratio);
+    }
+    // Restrict the collateral_currency dropdown to currencies the lender's
+    // offer actually accepts. Without this filter, the borrower can pick a
+    // currency the lender won't fund and waste a multimap entry posting a
+    // request that auto-fund will skip on the currency check.
+    // accepted_collateral may carry FQN strings (legacy) or i-addresses
+    // (current spec); match both formats so legacy offers still filter.
+    if (Array.isArray(prefill.accepted_collateral) && prefill.accepted_collateral.length > 0) {
+      const allowed = new Set(prefill.accepted_collateral);
+      const sel = formEl.querySelector('[data-f="collateral_currency"]');
+      if (sel) {
+        for (const opt of Array.from(sel.options)) {
+          // Keep option if its FQN value is in allowed, OR if its i-address
+          // resolution is in allowed. We don't pre-resolve here; the
+          // checks happen at post time via canonicalizeCurrency.
+          if (!allowed.has(opt.value)) opt.remove();
+        }
+        // If we filtered everything out, restore the first option so the
+        // user isn't stuck with an empty dropdown (rare; means the offer's
+        // accepted_collateral has unknown FQN strings).
+        if (sel.options.length === 0) {
+          sel.innerHTML = currencyOptions("VRSC");
+        }
+      }
     }
     formEl.scrollIntoView({ behavior: "smooth", block: "start" });
     runFormValidation(formEl);
