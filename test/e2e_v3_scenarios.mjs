@@ -225,7 +225,12 @@ async function waitForMarketSettled(page, { timeout = 120000 } = {}) {
 // so we wait until the previous cycle has rendered before clicking
 // market-refresh again. Pass a shared {t:0} object across pollUntil ticks.
 async function refreshIfIdle(page, ref) {
-  if (Date.now() - ref.t < 5000) return;
+  // 30s minimum gap between forced refreshes. Each loadMarket cycle fires
+  // 3 fetches (offers/matches/requests); two browsers from one IP share the
+  // 30/min public-tier limit. At 30s gate: 2 fires/min × 3 fetches = 6/min
+  // per browser × 2 = 12/min combined — comfortable headroom under the
+  // ceiling, leaves room for initial-load fanout and post-action refreshes.
+  if (Date.now() - ref.t < 30000) return;
   const isLoading = await page.evaluate(() => {
     const list = document.getElementById("market-list");
     return list?.textContent?.trim() === "Loading…";
