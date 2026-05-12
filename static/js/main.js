@@ -1083,18 +1083,6 @@ if (showStaleEl) {
   };
 }
 
-// Lender's local opt-in for auto-fund. The offer's auto_fund=true is
-// the lender's declared intent; this flag is "I'm at the wallet right
-// now, broadcasts may fire without further prompting". Without it, the
-// watcher detects candidates but stops at the confirm step.
-const LS_KEY_AUTO_FUND = "vl_auto_fund_enabled";
-const autoFundEl = document.getElementById("mp-auto-fund-toggle");
-if (autoFundEl) {
-  autoFundEl.checked = localStorage.getItem(LS_KEY_AUTO_FUND) === "1";
-  autoFundEl.onchange = () => {
-    localStorage.setItem(LS_KEY_AUTO_FUND, autoFundEl.checked ? "1" : "0");
-  };
-}
 
 // Two-level picker:
 //   R-address (your wallet root) → list of IDs under that R
@@ -6837,18 +6825,18 @@ async function lenderAutoFundWatcher() {
               });
               console.log(`[auto-fund] candidate request ${req.posted_tx?.slice(0,16)} from ${req.iaddr?.slice(0,12)} matches offer on ${ia.slice(0,12)}`);
             }
-            // Phase 2: fire the post-match flow via synthetic clicks
-            // against the existing battle-tested handlers. Opt-in via
-            // localStorage.vl_auto_fund_enabled = "1" so it doesn't
-            // surprise users on first run.
+            // Fire the post-match flow via synthetic clicks against the
+            // existing battle-tested handlers. The offer's auto_fund=true
+            // is the lender's declared consent — no second gate. To
+            // pause auto-fund, drop the offer (set active:false or
+            // cancel) or set auto_fund:false on a re-post.
             //
-            // The function itself manages _autoFundInFlight — it only
+            // fireAutoFundCandidate manages _autoFundInFlight — only
             // marks the request as "in-flight" once a broadcast actually
             // starts. Silent early returns (tab not active, row not in
             // DOM, re-quote failed) leave the request available for the
             // next 30s watcher cycle to retry.
-            if (localStorage.getItem("vl_auto_fund_enabled") === "1"
-                && !_autoFundInFlight.has(req.posted_tx)) {
+            if (!_autoFundInFlight.has(req.posted_tx)) {
               fireAutoFundCandidate(req, offer, ia).catch((e) => {
                 console.warn(`[auto-fund] fire failed for ${req.posted_tx?.slice(0,12)}: ${e?.message}`);
               });

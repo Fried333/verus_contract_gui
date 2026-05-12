@@ -25,12 +25,14 @@ Anyone can fork, extend, or replace it — the chain is the source of truth.
   (multi-route fallback: direct → Bridge.vETH → Bridge.vARRR → Pure) and
   auto-populates the suggested collateral at the lender's target ratio.
   User can override; suggestion stays live as inputs change
-- **Lender auto-fund (opt-in)** — lender's offer can carry `auto_fund:
-  true` and the GUI runs a 30s watcher that auto-posts the match when a
-  request matches the offer's criteria (currency, amount cap, term cap,
-  oracle-priced collateral ratio with a 1.5× hard floor). Wallet stays
-  unlocked, GUI signs locally — never holds keys server-side. Enable
-  via `localStorage.vl_auto_fund_enabled = "1"`
+- **Lender auto-fund (per-offer)** — lender's offer can carry
+  `auto_fund: true` and the GUI runs a 30s watcher that auto-posts a
+  loan.match when a request matches the offer's criteria (lend
+  currency, VRSC cap, term cap, oracle-priced collateral ratio with a
+  1.5× hard floor). Wallet stays unlocked, GUI signs locally — never
+  holds keys server-side. The offer's `auto_fund` flag is the lender's
+  declared consent; to pause, cancel the offer or re-post with
+  `auto_fund: false`.
 - **Active loans tab** — lists open loans on local identities, with a
   Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
   broadcasts, and posts `loan.history` for trade history

@@ -44,10 +44,6 @@
         <button data-mp-tab="history"  class="mp-tab" title="Settled or defaulted loans">History <span class="count" id="ct-history">·</span></button>
         <button data-mp-tab="market"   class="mp-tab" title="Browse all open offers from other parties — find a counterparty">Marketplace <span class="count" id="ct-market">·</span></button>
         <span style="flex:1"></span>
-        <label id="mp-auto-fund-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);margin:0;cursor:pointer" title="When ON, your GUI auto-posts a loan.match for any borrower request that fits an offer you've marked auto_fund=true. Wallet must stay unlocked. The offer's slippage tolerance is the only drift the watcher accepts; hard floor 1.5× regardless of your offer settings.">
-          <input type="checkbox" id="mp-auto-fund-toggle" style="margin:0">
-          🤖 Auto-fund
-        </label>
         <label id="mp-show-stale-wrap" style="display:flex;gap:6px;align-items:center;font-size:12px;color:var(--muted);margin:0;cursor:pointer" title="Hides entries past their valid_until_block / expires_block, and entries posted &gt; 7 days ago without an explicit expiry">
           <input type="checkbox" id="mp-show-stale" style="margin:0">
           Show stale
