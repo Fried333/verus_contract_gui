@@ -1,78 +1,46 @@
 # make-gui
 
-A minimal local web app for browsing and acting on Make Protocol contract
-markets (loan offers, loan requests, loan matches, loan status, option
-offers) directly against your local `verusd` daemon.
+Local web app for browsing and acting on [Make Protocol](https://github.com/Fried333/make-protocol) contract markets — loan offers, requests, matches, status — directly against your own `verusd` daemon. Reference client for the data layer specified in [SCHEMA.md](https://github.com/Fried333/make-protocol/blob/main/SCHEMA.md). Anyone can fork or replace it — the chain is the source of truth.
 
-This is a reference client for the data layer specified in
-[make-protocol/SCHEMA.md](https://github.com/Fried333/make-protocol/blob/main/SCHEMA.md).
-Anyone can fork, extend, or replace it — the chain is the source of truth.
+## Table of contents
 
-## What it does
+- [What you get](#what-you-get)
+- [What you provide](#what-you-provide)
+- [Quick start](#quick-start)
+- [Architecture](#architecture)
+- [VDXF keys recognised](#vdxf-keys-recognised)
+- [End-to-end validation](#end-to-end-validation)
+- [What's NOT yet wired](#whats-not-yet-wired)
+- [Operating in production](#operating-in-production)
+- [Related](#related)
+- [License](#license)
+- [Disclaimer](#disclaimer)
 
-- Lists VerusIDs in your wallet, grouped by their primary R-address
-- Shows the network-wide marketplace (open requests, open offers, matches)
-  pulled from the [scan.verus.cx](https://scan.verus.cx) explorer API
-- Lets you post `loan.request` and `loan.offer` entries on any of your
-  identities
-- **Borrower-first origination flow** — borrower posts a v2 `loan.request`
-  pre-signed against a fresh single-currency UTXO; lender posts a `loan.match`
-  containing all three pre-signed partials (Tx-A, Tx-Repay, Tx-B); borrower
-  clicks Accept to broadcast Tx-A and open the loan
-- **Oracle-driven collateral suggestion** — when the borrower picks a
-  principal currency + amount + collateral currency, the request form
-  fetches a live price via the local daemon's `estimateconversion`
-  (multi-route fallback: direct → Bridge.vETH → Bridge.vARRR → Pure) and
-  auto-populates the suggested collateral at the lender's target ratio.
-  User can override; suggestion stays live as inputs change
-- **Lender auto-fund (per-offer)** — lender's offer can carry
-  `auto_fund: true` and the GUI runs a 30s watcher that auto-posts a
-  loan.match when a request matches the offer's criteria (lend
-  currency, VRSC cap, term cap, oracle-priced collateral ratio with a
-  1.5× hard floor). Wallet stays unlocked, GUI signs locally — never
-  holds keys server-side. The offer's `auto_fund` flag is the lender's
-  declared consent; to pause, cancel the offer or re-post with
-  `auto_fund: false`. Counterparties see a `🤖 Auto-fund` badge on the
-  offer card so they know what to expect.
-- **Borrower auto-accept (per-request)** — borrower's request can carry
-  `auto_accept: true` (the "Auto-confirm if the lender's match honors
-  these exact terms" checkbox on the request form). When the lender
-  posts a `loan.match`, the borrower's GUI runs a 7-check safety
-  verification on the match against the original request:
-  - principal/collateral/repay amounts match (8-dp exact, integer
-    satoshi)
-  - principal output pays the borrower's R; repay + Tx-B outputs pay
-    the lender's R; vault output address matches the P2SH derived
-    from both pubkeys
-  - maturity_block ≤ today + term_days × 1440 (chain-wall protection
-    against a malicious lender setting an impossibly-distant maturity)
-  - currencies match between request and match (i-address compare,
-    SCHEMA.md §2)
+## What you get
 
-  If all seven checks pass, Tx-A broadcasts automatically — no second
-  click. If anything fails, the match surfaces in Inbox for manual
-  review. The flag is on-chain in the request payload; to pause, cancel
-  + re-post with the checkbox off. Counterparties see a `🤖 Auto-accept`
-  badge on the request card.
-- **Active loans tab** — lists open loans on local identities, with a
-  Repay button that auto-splits a clean repayment UTXO, extends Tx-Repay,
-  broadcasts, and posts `loan.history` for trade history
-- **Auto-split via `sendcurrency`** — no UTXO management; the GUI splits
-  fresh single-currency UTXOs in mempool for clean signing. Chained
-  parent-child broadcasts settle without confirmation waits
-- Cancel button removes entries
-- Activity tab — chronological feed of contract events scoped to acting ID
-- Communications tab (placeholder) — will surface encrypted z-memos via
-  identity `privateaddress` once Phase C lands
+- Marketplace tab — open requests, open offers, matches pulled from [scan.verus.cx](https://scan.verus.cx) for stranger discovery
+- Active loans tab — daemon-only view of loans involving your IDs, with one-click Repay
+- Activity tab — chronological feed of contract events scoped to the acting identity
+- **Borrower-first origination flow** — borrower posts a v2 `loan.request` pre-signed against a fresh single-currency UTXO; lender posts a `loan.match` carrying all three pre-signed partials (Tx-A, Tx-Repay, Tx-B); borrower clicks Accept to broadcast Tx-A and open the loan
+- **Oracle-driven collateral suggestion** — pick principal currency + amount + collateral currency, the form fetches a live price via `estimateconversion` (multi-route fallback: direct → Bridge.vETH → Bridge.vARRR → Pure) and auto-populates the suggested collateral at the lender's target ratio. Override-able; suggestion stays live as inputs change.
+- **Lender auto-fund (per-offer)** — offer can carry `auto_fund: true` and the GUI runs a 30s watcher that auto-posts a `loan.match` when a request matches (lend currency, VRSC cap, term cap, oracle-priced collateral ratio with 1.5× hard floor). Wallet stays unlocked, GUI signs locally — keys never leave the browser. Counterparties see a `🤖 Auto-fund` badge on the offer card.
+- **Borrower auto-accept (per-request)** — request can carry `auto_accept: true`. When a `loan.match` lands, the GUI runs a 7-check verification (amounts to 8-dp exact-integer-satoshi, output addresses, vault P2SH from both pubkeys, maturity ≤ today + term × 1440, currency i-addresses match). If all pass, Tx-A broadcasts automatically; if any fail, the match surfaces in Inbox for manual review.
+- **Auto-split via `sendcurrency`** — no UTXO management; the GUI splits fresh single-currency UTXOs in mempool for clean signing. Chained parent-child broadcasts settle without confirmation waits.
 
-## Run it
+## What you provide
 
-Requires:
-- Python 3.8+ (stdlib only — no pip install)
+- Python 3.8+ (stdlib only — no `pip install`)
 - A running `verusd` (Verus daemon) on the same machine
 - The daemon's `~/.komodo/VRSC/VRSC.conf` accessible (for RPC credentials)
+- A browser
+
+That's it. No accounts, no extensions, no third-party services beyond optional explorer reads.
+
+## Quick start
 
 ```bash
+git clone https://github.com/Fried333/make-gui.git
+cd make-gui
 python3 server.py
 # defaults to http://127.0.0.1:7777/
 # default conf path: ~/.komodo/VRSC/VRSC.conf
@@ -84,39 +52,30 @@ Override:
 python3 server.py --port 8080 --conf /path/to/VRSC.conf --bind 0.0.0.0
 ```
 
-Then open the URL in any browser. No installation, no extension.
+Then open the URL in any browser.
 
 ## Architecture
 
-- `server.py` — stdlib HTTP server. Serves `static/`, proxies `/rpc` to
-  `verusd` so the browser can speak to the daemon under one origin.
-- `static/index.html` — three-tab dashboard (Marketplace / Active loans /
-  Activity).
-- `static/js/main.js` — vanilla JS. Talks to local daemon via `/rpc` and
-  to the public explorer at `scan.verus.cx/api`.
-- `static/js/rpc.js` — thin RPC client.
-- `static/css/style.css` — minimal styling.
+- `server.py` — stdlib HTTP server. Serves `static/`, proxies `/rpc` to `verusd` so the browser speaks to the daemon under one origin (avoids CORS).
+- `static/index.html` — three-tab dashboard (Marketplace / Active loans / Activity)
+- `static/js/main.js` — vanilla JS. Talks to local daemon via `/rpc` and to `scan.verus.cx/api` for stranger discovery
+- `static/js/rpc.js` — thin RPC client
+- `static/css/style.css` — minimal styling
 
 State model:
-- **Browser localStorage**: ephemeral UI state (selected R-address, ID).
-- **Local daemon**: source of truth for your own state and any
-  counterparty you've transacted with (mempool-aware via
-  `getidentity <iaddr> -1`).
-- **Explorer API**: stranger discovery only — used by the Marketplace
-  tab to find offers from parties you haven't met yet, and to walk
-  full settlement history. The Loans tab is **daemon-only** — works
-  even if the explorer is down.
-- **Chain**: ultimate source of truth. Local + explorer are derivative.
 
-See [`DATA_SOURCES.md`](./DATA_SOURCES.md) for the per-feature breakdown
-of which calls go to your daemon vs. the explorer, why, and what the
-privacy / latency tradeoffs are.
+| Layer | Role |
+|---|---|
+| Browser `localStorage` | Ephemeral UI state (selected R-address, ID) — never load-bearing |
+| Local daemon | Source of truth for your own state + any counterparty you've transacted with (mempool-aware via `getidentity <iaddr> -1`) |
+| Explorer API | **Stranger discovery only** — used by Marketplace to find offers from parties you haven't met. Loans tab is daemon-only — works even if the explorer is down. |
+| Chain | Ultimate source of truth. Local + explorer are derivative. |
+
+See [`DATA_SOURCES.md`](./DATA_SOURCES.md) for the per-feature breakdown of which calls go to your daemon vs the explorer, and the privacy / latency tradeoffs.
 
 ## VDXF keys recognised
 
-All keys are namespaced under `make.VRSC@`
-(`iLWvRsiWVCEuFYhCSt2Qba7LxWksrgVerX`), the registered owner of the
-Make Protocol contracts standard.
+All keys are namespaced under `make.VRSC@` (`iLWvRsiWVCEuFYhCSt2Qba7LxWksrgVerX`), the registered owner of the Make Protocol contracts standard.
 
 | Key | VDXF id |
 |---|---|
@@ -128,36 +87,49 @@ Make Protocol contracts standard.
 | `make.vrsc::contract.loan.decline` | `iEgciB3u2GwTxzShQR4eFhtj4k8Zv6frNb` |
 | `make.vrsc::contract.option.offer` | `i5L8vkz9xsnM8yEDiXzPbP4Kix3SnJSsv5` |
 
-VDXF ids are deterministic — re-derive any of them with
-`verus getvdxfid "make.vrsc::contract.loan.offer"`.
+VDXF ids are deterministic — re-derive any of them with `verus getvdxfid "make.vrsc::contract.loan.offer"`.
 
 ## End-to-end validation
 
-Full lifecycle (request → match → accept → repay, plus 8 edge cases —
-cancels, manual accept, lost localStorage, insufficient funds, chain-only
-recovery, replay safety) plus the new **lender auto-fund** pipeline
-(scenario 14: offer + matching request → match auto-posted → loan
-settled, no manual lender click) validated via Playwright driving two
-browser instances against two local daemons on Verus mainnet. See
-`test_e2e_v3_all.mjs` for the test driver.
+Full lifecycle (request → match → accept → repay), plus 8 edge cases (cancels, manual accept, lost localStorage, insufficient funds, chain-only recovery, replay safety), plus the **lender auto-fund** pipeline (scenario 14: offer + matching request → match auto-posted → loan settled, no manual lender click), validated via Playwright driving two browser instances against two local daemons on Verus mainnet. See `test_e2e_v3_all.mjs`.
 
 ## What's NOT yet wired
 
-- **Lender's claim-collateral path** — after maturity, the GUI knows
-  Tx-B is in the borrower's `loan.status.tx_b_complete` field but the
-  one-click claim flow on the lender side isn't wired yet. Funds still
-  reachable via cooperative manual sign as a workaround.
-- **Z-memo messaging** — Communications tab is a placeholder. Real
-  send/receive against identity `privateaddress` is Phase C+.
-- **Tx-C rescue path** — the optional last-resort borrower-side
-  recovery (far-future nLockTime) is in the spec but not in the GUI yet.
+- **Lender's claim-collateral path** — after maturity, the GUI knows Tx-B from the borrower's `loan.status.tx_b_complete` field, but the one-click claim flow on the lender side isn't wired yet. Funds still reachable via cooperative manual sign as a workaround.
+- **Z-memo messaging** — Communications tab is a placeholder. Real send/receive against identity `privateaddress` is Phase C+.
+- **Tx-C rescue path** — the optional last-resort borrower-side recovery (far-future nLockTime) is in the spec but not in the GUI yet.
 
-## License
+## Operating in production
 
-MIT.
+This is a **local single-user tool**, not a hosted service. Don't expose port 7777 to the public internet — it speaks directly to your daemon's wallet RPC and any caller who can reach it can drive your identities.
+
+### Common errors
+
+| Symptom | Likely cause |
+|---|---|
+| "verusd unreachable" on first load | wrong `--conf` path, or daemon not running |
+| "no IDs found" on the picker | the daemon's wallet doesn't control any identities (`verus listidentities`) |
+| Marketplace tab spinning | explorer (`scan.verus.cx`) is down — Active loans + Activity still work, marketplace recovers when explorer is back |
+| Repay button gives "insufficient funds" | acting identity has no clean single-currency UTXO; the GUI auto-splits via `sendcurrency` but needs a parent UTXO to split from |
+
+### Backup considerations
+
+- Wallet keys (your identity primaries) live in the daemon's `wallet.dat` — back that up
+- `loan.match` payload templates are persisted in the lender's VerusID `contentmultimap` (chain-resident), but the lender SHOULD also keep a local copy of the raw partial bytes — a wallet seed alone is enough to recover identities but not to re-sign a partial that was already broadcast as part of a match
+- The GUI itself is stateless beyond browser `localStorage` (UI preferences only)
 
 ## Related
 
-- Spec / protocol: [github.com/Fried333/make-protocol](https://github.com/Fried333/make-protocol)
+- Protocol spec: [github.com/Fried333/make-protocol](https://github.com/Fried333/make-protocol)
 - Public block explorer: [scan.verus.cx](https://scan.verus.cx)
 - Verus: [verus.io](https://verus.io)
+
+## License
+
+MIT — see [LICENSE](./LICENSE) if present, or the standard MIT terms.
+
+## Disclaimer
+
+This software is provided **"AS IS"**, without warranty of any kind, express or implied. In no event shall the authors or copyright holders be liable for any claim, damages, or other liability arising from the use of this software.
+
+Make Protocol contracts involve real funds. Before using this client for production loans, audit the request→match→accept flow against your own threat model, verify the on-chain transactions before broadcast, and treat the auto-fund / auto-accept features as convenience automations that you have full responsibility for — they sign and broadcast with no second human in the loop.
